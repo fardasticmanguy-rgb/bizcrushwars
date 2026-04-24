@@ -5,7 +5,7 @@ import { loadLandMask } from "@/game/landMask";
 import worldMap from "@/assets/map-world.jpg";
 import { Button } from "@/components/ui/button";
 import { LogOut, Anchor, Shield, Factory } from "lucide-react";
-
+import './routes/styles.css'
 type Lobby = {
   id: string;
   code: string;
