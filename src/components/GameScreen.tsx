@@ -388,11 +388,13 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         const newUnits = Math.min(9999, p.units + Math.max(1, Math.round(px / 4)));
         const alive = px > 0 || p.units > 0;
         updates.push(
-          supabase
-            .from("lobby_players")
-            .update({ pixels: px, units: newUnits, alive })
-            .eq("lobby_id", lobby.id)
-            .eq("player_id", p.player_id),
+          Promise.resolve(
+            supabase
+              .from("lobby_players")
+              .update({ pixels: px, units: newUnits, alive })
+              .eq("lobby_id", lobby.id)
+              .eq("player_id", p.player_id),
+          ),
         );
       });
       await Promise.all(updates);
