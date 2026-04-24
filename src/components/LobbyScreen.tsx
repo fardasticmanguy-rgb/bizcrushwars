@@ -4,6 +4,7 @@ import { Slider } from "@/components/ui/slider";
 import { supabase } from "@/integrations/supabase/client";
 import { MAPS, BOT_NAMES, pickColor, PLAYER_COLORS } from "@/game/constants";
 import { Copy, X, Check } from "lucide-react";
+import worldMap from "@/assets/map-world.jpg";
 
 type Lobby = {
   id: string;
@@ -163,7 +164,7 @@ export function LobbyScreen({ lobby, playerId, onLeave, onStart }: LobbyScreenPr
                   <div
                     className="mb-1 aspect-video w-full rounded bg-cover bg-center"
                     style={{
-                      backgroundImage: `url(/src/assets/map-world.jpg)`,
+                      backgroundImage: `url(${worldMap})`,
                       backgroundPosition: `${m.center[0] * 100}% ${m.center[1] * 100}%`,
                       backgroundSize: m.id === "world" ? "100%" : "300%",
                     }}
