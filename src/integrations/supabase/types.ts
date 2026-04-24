@@ -14,80 +14,100 @@ export type Database = {
   }
   public: {
     Tables: {
-      attacks: {
+      lobbies: {
         Row: {
-          attacker_id: string
+          bots: number
+          code: string
           created_at: string
-          from_territory: number
-          id: number
-          to_territory: number
-          units: number
+          difficulty: string
+          host_id: string
+          id: string
+          map_id: string
+          mode: string
+          started_at: string | null
+          status: string
         }
         Insert: {
-          attacker_id: string
+          bots?: number
+          code: string
           created_at?: string
-          from_territory: number
-          id?: number
-          to_territory: number
-          units: number
-        }
-        Update: {
-          attacker_id?: string
-          created_at?: string
-          from_territory?: number
-          id?: number
-          to_territory?: number
-          units?: number
-        }
-        Relationships: []
-      }
-      players: {
-        Row: {
-          color: string
-          id: string
-          joined_at: string
-          last_seen: string
-          name: string
-        }
-        Insert: {
-          color: string
-          id: string
-          joined_at?: string
-          last_seen?: string
-          name: string
-        }
-        Update: {
-          color?: string
+          difficulty?: string
+          host_id: string
           id?: string
-          joined_at?: string
-          last_seen?: string
-          name?: string
+          map_id?: string
+          mode?: string
+          started_at?: string | null
+          status?: string
+        }
+        Update: {
+          bots?: number
+          code?: string
+          created_at?: string
+          difficulty?: string
+          host_id?: string
+          id?: string
+          map_id?: string
+          mode?: string
+          started_at?: string | null
+          status?: string
         }
         Relationships: []
       }
-      territories: {
+      lobby_players: {
         Row: {
-          color: string | null
-          id: number
-          owner_id: string | null
+          alive: boolean
+          color: string
+          dot_x: number
+          dot_y: number
+          id: string
+          is_bot: boolean
+          joined_at: string
+          lobby_id: string
+          name: string
+          pixels: number
+          player_id: string
+          team: number
           units: number
-          updated_at: string
         }
         Insert: {
-          color?: string | null
-          id: number
-          owner_id?: string | null
+          alive?: boolean
+          color: string
+          dot_x?: number
+          dot_y?: number
+          id?: string
+          is_bot?: boolean
+          joined_at?: string
+          lobby_id: string
+          name: string
+          pixels?: number
+          player_id: string
+          team?: number
           units?: number
-          updated_at?: string
         }
         Update: {
-          color?: string | null
-          id?: number
-          owner_id?: string | null
+          alive?: boolean
+          color?: string
+          dot_x?: number
+          dot_y?: number
+          id?: string
+          is_bot?: boolean
+          joined_at?: string
+          lobby_id?: string
+          name?: string
+          pixels?: number
+          player_id?: string
+          team?: number
           units?: number
-          updated_at?: string
         }
-        Relationships: []
+        Relationships: [
+          {
+            foreignKeyName: "lobby_players_lobby_id_fkey"
+            columns: ["lobby_id"]
+            isOneToOne: false
+            referencedRelation: "lobbies"
+            referencedColumns: ["id"]
+          },
+        ]
       }
     }
     Views: {
