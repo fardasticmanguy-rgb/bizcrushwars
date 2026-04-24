@@ -1,25 +1,31 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { GameCanvas } from "@/components/GameCanvas";
+import { App } from "@/components/App";
+import { Toaster } from "@/components/ui/sonner";
 
 export const Route = createFileRoute("/")({
   component: Index,
   head: () => ({
     meta: [
-      { title: "Territoria — Multiplayer War Room" },
+      { title: "FrontWars — Real-Time Territorial Conquest" },
       {
         name: "description",
         content:
-          "Real-time multiplayer territorial conquest. Claim land, build units, crush rivals.",
+          "Multiplayer territorial flood-fill war game. Claim land, crush rivals in real time.",
       },
-      { property: "og:title", content: "Territoria — Multiplayer War Room" },
+      { property: "og:title", content: "FrontWars — Real-Time Territorial Conquest" },
       {
         property: "og:description",
-        content: "Real-time multiplayer territorial conquest game.",
+        content: "Multiplayer flood-fill territorial conquest game.",
       },
     ],
   }),
 });
 
 function Index() {
-  return <GameCanvas />;
+  return (
+    <>
+      <App />
+      <Toaster />
+    </>
+  );
 }
