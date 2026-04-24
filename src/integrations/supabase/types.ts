@@ -14,7 +14,81 @@ export type Database = {
   }
   public: {
     Tables: {
-      [_ in never]: never
+      attacks: {
+        Row: {
+          attacker_id: string
+          created_at: string
+          from_territory: number
+          id: number
+          to_territory: number
+          units: number
+        }
+        Insert: {
+          attacker_id: string
+          created_at?: string
+          from_territory: number
+          id?: number
+          to_territory: number
+          units: number
+        }
+        Update: {
+          attacker_id?: string
+          created_at?: string
+          from_territory?: number
+          id?: number
+          to_territory?: number
+          units?: number
+        }
+        Relationships: []
+      }
+      players: {
+        Row: {
+          color: string
+          id: string
+          joined_at: string
+          last_seen: string
+          name: string
+        }
+        Insert: {
+          color: string
+          id: string
+          joined_at?: string
+          last_seen?: string
+          name: string
+        }
+        Update: {
+          color?: string
+          id?: string
+          joined_at?: string
+          last_seen?: string
+          name?: string
+        }
+        Relationships: []
+      }
+      territories: {
+        Row: {
+          color: string | null
+          id: number
+          owner_id: string | null
+          units: number
+          updated_at: string
+        }
+        Insert: {
+          color?: string | null
+          id: number
+          owner_id?: string | null
+          units?: number
+          updated_at?: string
+        }
+        Update: {
+          color?: string | null
+          id?: number
+          owner_id?: string | null
+          units?: number
+          updated_at?: string
+        }
+        Relationships: []
+      }
     }
     Views: {
       [_ in never]: never
