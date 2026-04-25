@@ -47,10 +47,15 @@ function hexRgb(hex: string): [number, number, number] {
 }
 
 const DIFFICULTY_SPEED: Record<string, number> = {
-  relaxed: 0.5,
-  balanced: 1.0,
-  intense: 1.8,
+  relaxed: 0.4,
+  balanced: 0.7,
+  intense: 1.1,
 };
+
+// How many units one tile claim costs (drains your army as you expand)
+const COST_PER_CLAIM = 0.35;
+// Cooldown between expansion waves (ms) — gives "pulse" feel
+const ATTACK_INTERVAL_MS = 600;
 
 // Building costs in units
 const BUILD_COST: Record<BuildingType, number> = {
@@ -71,6 +76,7 @@ type CtxMenu = {
   isOwnTerritory: boolean;
   isLand: boolean;
   nearOwnPort: boolean;
+  enemyPlayerId: string | null; // for alliance proposals
 } | null;
 
 // Naval invasion mode state
