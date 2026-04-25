@@ -22,16 +22,20 @@ type Lobby = {
 type Phase = "menu" | "lobby" | "game";
 
 export function App() {
-  const [playerId] = useState(() => getOrCreatePlayerId());
-  const [username, setUsername] = useState(
-    () => localStorage.getItem(NAME_KEY) ?? "",
-  );
+  const [playerId, setPlayerId] = useState("");
+  const [username, setUsername] = useState("");
   const [phase, setPhase] = useState<Phase>("menu");
   const [lobby, setLobby] = useState<Lobby | null>(null);
 
   useEffect(() => {
+    setPlayerId(getOrCreatePlayerId());
+    setUsername(localStorage.getItem(NAME_KEY) ?? "");
+  }, []);
+
+  useEffect(() => {
     if (username) localStorage.setItem(NAME_KEY, username);
   }, [username]);
+
 
   async function joinLobbyAsPlayer(lob: Lobby) {
     const { data: existing } = await supabase
