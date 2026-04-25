@@ -354,7 +354,8 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         const px = pixelCounts[idx]??0;
         const passive = Math.round(Math.sqrt(px)*2*regenMult);
         const newUnits = Math.min(9999+(popCapBonus[idx]||0), p.units+passive+(unitBonus[idx]||0));
-        const newCoins = Math.min(99999, (p.coins||0)+(coinBonus[idx]||0));
+        const passiveCoins = Math.max(1, Math.floor(Math.sqrt(px) * 0.3 * regenMult));
+        const newCoins = Math.min(99999, (p.coins||0)+passiveCoins+(coinBonus[idx]||0));
         const alive = px>0||p.units>0;
         updates.push(supabase.from("lobby_players")
           .update({ pixels:px, units:newUnits, coins:newCoins, alive })
