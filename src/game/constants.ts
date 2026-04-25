@@ -46,11 +46,12 @@ export function pickColor(taken: string[]) {
 }
 
 export function getOrCreatePlayerId() {
+  if (typeof window === "undefined") return "";
   const k = "frontwars_player_id";
-  let id = localStorage.getItem(k);
+  let id = window.localStorage.getItem(k);
   if (!id) {
     id = crypto.randomUUID();
-    localStorage.setItem(k, id);
+    window.localStorage.setItem(k, id);
   }
   return id;
 }
