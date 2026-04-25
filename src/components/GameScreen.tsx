@@ -4,8 +4,9 @@ import { GRID_W, GRID_H, MAPS } from "@/game/constants";
 import { loadLandMask } from "@/game/landMask";
 import worldMap from "@/assets/map-world.jpg";
 import { Button } from "@/components/ui/button";
-import { LogOut, Anchor, Shield, Factory } from "lucide-react";
-import './routes/styles.css'
+import { LogOut, Anchor, Shield, Factory, Handshake, Zap, Hand } from "lucide-react";
+import { toast } from "sonner";
+
 type Lobby = {
   id: string;
   code: string;
