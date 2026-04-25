@@ -927,6 +927,12 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     const def = defEntry ? playersRef.current.get(defEntry[0]) : null;
     if (!def) return;
 
+    // Block attacks on allies
+    if (alliesRef.current.includes(def.player_id)) {
+      showNotif(`${def.name} is your ally — break alliance first`);
+      return;
+    }
+
     const sending = Math.max(1, Math.floor(me.units * sendPctRef.current / 100));
     const mask = landMaskRef.current;
     const hasFort = buildingsRef.current.some((b) => b.type === "fort" && b.gridIdx === i);
