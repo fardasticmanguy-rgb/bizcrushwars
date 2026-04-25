@@ -28,9 +28,9 @@ export const MAPS = [
   { id: "australia", name: "Australia", center: [0.82, 0.70] as [number, number] },
 ];
 
-// Territory grid — higher res = smaller, more fluid-looking cells
-export const GRID_W = 480;
-export const GRID_H = 240;
+// Low-resolution territory grid for flood-fill (synced via realtime broadcast)
+export const GRID_W = 192;
+export const GRID_H = 96;
 
 export function genCode() {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
