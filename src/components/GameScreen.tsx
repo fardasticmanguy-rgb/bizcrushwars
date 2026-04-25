@@ -702,6 +702,17 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         ctx.lineWidth = 1.5;
         ctx.stroke();
 
+        // Alliance shield ring
+        if (!isMe && alliesRef.current.includes(p.player_id)) {
+          ctx.beginPath();
+          ctx.arc(px, py, 12, 0, Math.PI * 2);
+          ctx.strokeStyle = "rgba(120,200,255,0.95)";
+          ctx.lineWidth = 2;
+          ctx.setLineDash([3, 2]);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
+
         ctx.beginPath();
         ctx.arc(px, py, isMe ? 3.5 : 2.5, 0, Math.PI * 2);
         ctx.fillStyle = "rgba(255,255,255,0.85)";
