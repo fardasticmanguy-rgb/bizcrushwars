@@ -166,18 +166,30 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
   const [navalMode, setNavalMode] = useState<NavalMode>(null);
   const [buildings, setBuildings] = useState<Building[]>([]);
   const [notification, setNotification] = useState<string | null>(null);
+  const [autoMode, setAutoMode] = useState(true);
+  const [allies, setAllies] = useState<string[]>([]); // playerIds we are allied with
+  const [pendingAlliances, setPendingAlliances] = useState<string[]>([]); // incoming proposals
+  const [attackCooldown, setAttackCooldown] = useState(0); // 0..1 progress until next pulse
+
   const sendPctRef = useRef(50);
   const navalModeRef = useRef<NavalMode>(null);
   const buildingsRef = useRef<Building[]>([]);
+  const autoModeRef = useRef(true);
+  const alliesRef = useRef<string[]>([]);
+  const lastAttackRef = useRef<number>(0);
 
   useEffect(() => { sendPctRef.current = sendPct; }, [sendPct]);
   useEffect(() => { navalModeRef.current = navalMode; }, [navalMode]);
   useEffect(() => { buildingsRef.current = buildings; }, [buildings]);
+  useEffect(() => { autoModeRef.current = autoMode; }, [autoMode]);
+  useEffect(() => { alliesRef.current = allies; }, [allies]);
 
   function showNotif(msg: string) {
     setNotification(msg);
+    toast(msg);
     setTimeout(() => setNotification(null), 2500);
   }
+
 
   const ownerGridRef = useRef<Int16Array>(new Int16Array(GRID_W * GRID_H).fill(-1));
   const landMaskRef = useRef<Uint8Array | null>(null);
