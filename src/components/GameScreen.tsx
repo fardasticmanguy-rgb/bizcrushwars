@@ -403,8 +403,11 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
 
     // Per-player accumulated unit cost from the current attack pulse
     const pulseSpend = new Map<string, number>();
+    const speed = DIFFICULTY_SPEED[lobby.difficulty] ?? 1;
+    let lastUiCooldown = 0;
 
-    function simulate(dt: number) {
+    function simulate(_dt: number) {
+      void _dt;
       const mask = landMaskRef.current;
       if (!mask) return;
       const grid = ownerGridRef.current;
@@ -416,11 +419,14 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
       // Pulse cooldown progress (used by UI)
       const since = now - lastAttackRef.current;
       const progress = Math.min(1, since / ATTACK_INTERVAL_MS);
-      // throttle React updates
-      if (Math.abs(progress - attackCooldown) > 0.05) setAttackCooldown(progress);
+      if (Math.abs(progress - lastUiCooldown) > 0.08) {
+        lastUiCooldown = progress;
+        setAttackCooldown(progress);
+      }
       if (since < ATTACK_INTERVAL_MS) return;
       lastAttackRef.current = now;
       pulseSpend.clear();
+
 
       const claims: { i: number; o: number }[] = [];
       const ally = alliesRef.current;
