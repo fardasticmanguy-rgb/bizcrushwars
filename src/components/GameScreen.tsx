@@ -1134,39 +1134,44 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
           </div>
         </div>
         <div className="h-8 w-px bg-border" />
-        <div className="flex gap-1">
-          {[["＋", 1.2], ["－", 0.83], ["⌂", "reset"]].map(([label, val]) => (
-            <button key={String(label)}
-              onClick={() => {
-                if (val === "reset") { camRef.current = { x: 0, y: 0, zoom: 1 }; }
-                else { const cam = camRef.current; cam.zoom = Math.min(6, Math.max(0.4, cam.zoom * Number(val))); }
-              }}
-              className="flex h-7 w-7 items-center justify-center rounded border border-border bg-background/60 text-sm hover:bg-secondary">
-              {label}
-            </button>
-          ))}
-        </div>
-        {myPorts.length > 0 && (
-          <>
-            <div className="h-8 w-px bg-border" />
+        {/* Auto / Manual mode toggle */}
+        <div className="flex flex-col items-center gap-1">
+          <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Mode</span>
+          <div className="flex overflow-hidden rounded border border-border">
             <button
-              onClick={startNavalMode}
-              className="flex items-center gap-1.5 rounded border border-cyan-500/40 bg-cyan-950/50 px-2.5 py-1 text-xs text-cyan-300 hover:bg-cyan-900/60 transition-colors">
-              <Anchor className="h-3 w-3" /> Naval
+              onClick={() => setAutoMode(true)}
+              className={`flex items-center gap-1 px-2 py-1 text-xs transition-colors ${autoMode ? "bg-primary text-primary-foreground" : "bg-background/60 hover:bg-secondary"}`}
+            >
+              <Zap className="h-3 w-3" /> Auto
             </button>
-          </>
-        )}
-        {me && (
-          <>
-            <div className="h-8 w-px bg-border" />
-            <div className="flex items-center gap-2 text-xs">
-              <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: me.color }} />
-              <span className="font-medium">{me.name}</span>
-              <span className="font-mono text-muted-foreground">{me.units}u · {me.pixels}px</span>
-            </div>
-          </>
-        )}
-      </div>
+            <button
+              onClick={() => setAutoMode(false)}
+              className={`flex items-center gap-1 px-2 py-1 text-xs transition-colors ${!autoMode ? "bg-primary text-primary-foreground" : "bg-background/60 hover:bg-secondary"}`}
+            >
+              <Hand className="h-3 w-3" /> Manual
+            </button>
+          </div>
+        </div>
+        <div className="h-8 w-px bg-border" />
+        {/* Attack-pulse cooldown bar */}
+        <div className="flex flex-col items-center gap-1">
+          <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Pulse</span>
+          <div className="h-2 w-24 overflow-hidden rounded-full bg-background/60 border border-border">
+            <div className="h-full bg-primary transition-[width] duration-100" style={{ width: `${Math.round(attackCooldown * 100)}%` }} />
+          </div>
+        </div>
+        <div className="h-8 w-px bg-border" />
+        <div className="flex gap-1">
+          <button
+            onClick={() => { const c = camRef.current; c.zoom = Math.min(6, c.zoom * 1.2); }}
+            className="flex h-7 w-7 items-center justify-center rounded border border-border bg-background/60 text-sm hover:bg-secondary">+</button>
+          <button
+            onClick={() => { const c = camRef.current; c.zoom = Math.max(0.4, c.zoom * 0.83); }}
+            className="flex h-7 w-7 items-center justify-center rounded border border-border bg-background/60 text-sm hover:bg-secondary">−</button>
+          <button
+            onClick={() => { camRef.current = { x: 0, y: 0, zoom: 1 }; }}
+            className="flex h-7 w-7 items-center justify-center rounded border border-border bg-background/60 text-xs hover:bg-secondary">⌂</button>
+        </div>
 
       {/* Right-click context menu */}
       {ctxMenu && (
