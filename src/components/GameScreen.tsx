@@ -1268,6 +1268,26 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
             </button>
           )}
 
+          {/* Alliance options when right-clicking near another player's dot */}
+          {ctxMenu.enemyPlayerId && !allies.includes(ctxMenu.enemyPlayerId) && !pendingAlliances.includes(ctxMenu.enemyPlayerId) && (
+            <button onClick={() => proposeAlliance(ctxMenu.enemyPlayerId!)}
+              className="flex w-full items-center px-3 py-2 text-sm hover:bg-secondary text-left transition-colors border-t border-border">
+              <Handshake className="mr-2 h-4 w-4" /> Propose Alliance
+            </button>
+          )}
+          {ctxMenu.enemyPlayerId && pendingAlliances.includes(ctxMenu.enemyPlayerId) && (
+            <button onClick={() => acceptAlliance(ctxMenu.enemyPlayerId!)}
+              className="flex w-full items-center px-3 py-2 text-sm hover:bg-secondary text-left transition-colors border-t border-border text-cyan-300">
+              <Handshake className="mr-2 h-4 w-4" /> Accept Alliance
+            </button>
+          )}
+          {ctxMenu.enemyPlayerId && allies.includes(ctxMenu.enemyPlayerId) && (
+            <button onClick={() => breakAlliance(ctxMenu.enemyPlayerId!)}
+              className="flex w-full items-center px-3 py-2 text-sm hover:bg-secondary text-left transition-colors border-t border-border text-amber-300">
+              <Handshake className="mr-2 h-4 w-4" /> Break Alliance
+            </button>
+          )}
+
           <button onClick={() => setCtxMenu(null)}
             className="flex w-full items-center px-3 py-2 text-sm hover:bg-secondary text-left transition-colors border-t border-border text-muted-foreground">
             ❌ Cancel
