@@ -26,11 +26,9 @@ type Building = { type: BuildingType; ownerIdx: number; gridIdx: number };
 type BombType = "atom" | "hydrogen" | "dirty";
 type UnitType = "infantry" | "tank" | "warship";
 
-// Attack target — player right-clicked an enemy, border expands toward them
-// This is persistent (not draining) — it biases the spread direction until cancelled or new target set
 type AttackTarget = {
   ownerIdx: number;
-  targetIdx: number;  // grid cell being attacked toward
+  targetIdx: number;
   unitType: UnitType;
 };
 
@@ -38,38 +36,42 @@ type Ship = {
   id: string; ownerIdx: number;
   fromX: number; fromY: number; toX: number; toY: number;
   units: number; targetGridIdx: number; progress: number;
-  distanceTiles: number; // actual manhattan distance for speed calc
+  distanceTiles: number;
 };
 
 type RadZone = { gridIdx: number; strength: number; decay: number };
-
 type PlaceMode = { type: BuildingType } | null;
 type Particle = { x: number; y: number; vx: number; vy: number; life: number; color: string };
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 const DIFFICULTY_REGEN: Record<string, number> = { relaxed: 0.6, balanced: 1.0, intense: 1.5 };
 
-// Pressure simulation — OpenFront style: slow organic border growth
-// Tiles spread one at a time from your border, directed toward your attack target
-const PASSIVE_SPREAD_CHANCE = 0.003;  // per-border-tile per tick, no target
-const ATTACK_SPREAD_CHANCE  = 0.018;  // per-border-tile per tick, toward target
+// ── Core attack mechanics (OpenFront / Territorial style) ─────────────────
+// No passive spreading. Territory only moves when you have an active attack target.
+// Rate scales with deployed units (your units × deploy%). Each flip costs units.
+
+const ATTACK_SPREAD_BASE    = 0.0022;  // base flip-chance per border tile per 16ms at 500 deployed units
+const UNIT_SCALE_BASE       = 500;     // deployed units that produce base attack rate
+const FLIP_COST_NEUTRAL     = 1;       // attacker units consumed per neutral tile flip
+const FLIP_COST_ENEMY_BASE  = 5;       // attacker units consumed per enemy tile flip (× defMult)
+const FLIP_COST_DEFENDER    = 3;       // defender units consumed per lost tile
+
 const FORT_DEFENSE   = 3.0;
 const DEFPOST_MULT   = 1.8;
 const MAX_STRENGTH   = 100;
-const REGEN_RATE     = 0.3;
+const REGEN_RATE     = 0.15;          // slower regen — makes attacking actually drain defense
 
-// Unit multipliers on spread chance
-const UNIT_MULT: Record<UnitType, number> = { infantry: 1.0, tank: 2.5, warship: 1.5 };
+// Unit multipliers on attack rate
+const UNIT_MULT: Record<UnitType, number> = { infantry: 1.0, tank: 2.2, warship: 1.4 };
 const UNIT_COST: Record<UnitType, number> = { infantry: 0, tank: 80, warship: 60 };
 
 const FACTORY_UNITS  = 8;
 const PORT_COINS     = 3;
 const CITY_COINS     = 2;
 const CITY_POP_CAP   = 500;
-const STARTER_RADIUS = 2;   // tiny spawn — just a few cells
+const STARTER_RADIUS = 4;   // a little bigger so you can actually see yourself
 
-// Ship speed: tiles per ms (we'll compute actual travel time from distance)
-const SHIP_TILES_PER_MS = 0.004; // ~250ms per tile — feels like it's crossing ocean
+const SHIP_TILES_PER_MS = 0.004;
 
 const BUILD_COST: Record<BuildingType, [number, number]> = {
   city: [80, 0], defense_post: [30, 20], port: [60, 0], fort: [40, 40],
@@ -103,7 +105,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
 
   const [players,      setPlayers]      = useState<LobbyPlayer[]>([]);
   const [,             setTick]         = useState(0);
-  const [sendPct,      setSendPct]      = useState(20);
+  const [deployPct,    setDeployPct]    = useState(50);   // % of units deployed to attack front
   const [placeMode,    setPlaceMode]    = useState<PlaceMode>(null);
   const [bombMode,     setBombMode]     = useState<BombType | null>(null);
   const [buildings,    setBuildings]    = useState<Building[]>([]);
@@ -111,20 +113,20 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
   const [isDead,       setIsDead]       = useState(false);
   const [isSpectating, setIsSpectating] = useState(false);
   const [unitType,     setUnitType]     = useState<UnitType>("infantry");
-  const [attackTarget, setAttackTarget] = useState<{ name: string } | null>(null); // just for UI display
+  const [attackTarget, setAttackTarget] = useState<{ name: string } | null>(null);
 
-  const sendPctRef    = useRef(20);
+  const deployPctRef  = useRef(50);
   const buildingsRef  = useRef<Building[]>([]);
   const placeModeRef  = useRef<PlaceMode>(null);
   const bombModeRef   = useRef<BombType | null>(null);
   const unitTypeRef   = useRef<UnitType>("infantry");
   const keysRef       = useRef<Set<string>>(new Set());
 
-  useEffect(() => { sendPctRef.current  = sendPct;  }, [sendPct]);
-  useEffect(() => { buildingsRef.current = buildings; }, [buildings]);
-  useEffect(() => { placeModeRef.current = placeMode; }, [placeMode]);
-  useEffect(() => { bombModeRef.current  = bombMode;  }, [bombMode]);
-  useEffect(() => { unitTypeRef.current  = unitType;  }, [unitType]);
+  useEffect(() => { deployPctRef.current   = deployPct;  }, [deployPct]);
+  useEffect(() => { buildingsRef.current   = buildings;  }, [buildings]);
+  useEffect(() => { placeModeRef.current   = placeMode;  }, [placeMode]);
+  useEffect(() => { bombModeRef.current    = bombMode;   }, [bombMode]);
+  useEffect(() => { unitTypeRef.current    = unitType;   }, [unitType]);
 
   // ── Grid state ────────────────────────────────────────────────────────────
   const ownerGridRef    = useRef<Int16Array>(new Int16Array(GRID_W * GRID_H).fill(-1));
@@ -133,9 +135,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
   const coastMaskRef    = useRef<Uint8Array | null>(null);
   const radZonesRef     = useRef<RadZone[]>([]);
   const shipsRef        = useRef<Ship[]>([]);
-  // My attack target — persistent directional bias (not a draining budget)
   const myTargetRef     = useRef<AttackTarget | null>(null);
-  // Bot targets
   const botTargetsRef   = useRef<Map<number, AttackTarget>>(new Map());
   const playersRef      = useRef<Map<string, LobbyPlayer>>(new Map());
   const playerIndexRef  = useRef<Map<string, number>>(new Map());
@@ -245,6 +245,202 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     loadLandMask().then(m => { landMaskRef.current = m; coastMaskRef.current = buildCoastMask(m); });
   }, []);
 
+  // ─── Core pressure simulation — OpenFront/Territorial style ──────────────
+  //
+  // How it works:
+  //   • NO passive spreading. Borders don't move unless you have an attack target.
+  //   • When attacking: your deployed units (units × deployPct%) push your border
+  //     toward the target tile like acid eating through territory.
+  //   • Each tile flip COSTS real units from the attacker. Stronger defenses cost more.
+  //   • The defender also loses units when they lose a tile.
+  //   • Deploy% controls how aggressively you push — higher = faster attack but you
+  //     burn through units quicker, leaving less to defend with.
+  //
+  function tickPressure(dt: number) {
+    const mask = landMaskRef.current; if (!mask) return;
+    const grid = ownerGridRef.current;
+    const str  = strengthGridRef.current;
+    const blds = buildingsRef.current;
+    const myTarget   = myTargetRef.current;
+    const botTargets = botTargetsRef.current;
+
+    // Strength regen on owned tiles (slower than before — sustained pressure matters)
+    const regenMult = DIFFICULTY_REGEN[lobby.difficulty] ?? 1;
+    for (let i = 0; i < grid.length; i++) {
+      if (grid[i] < 0) continue;
+      str[i] = Math.min(MAX_STRENGTH, str[i] + REGEN_RATE * regenMult * dt * 0.04);
+    }
+
+    const claims: { i: number; o: number; s: number }[] = [];
+    const mr  = mapRectRef.current;
+    const cam = camRef.current;
+
+    // Helper: spawn attack particles
+    const spawnParticles = (ni: number, o: number, count: number) => {
+      const col = colorsRef.current[o] ? `rgb(${colorsRef.current[o].join(",")})` : "#fff";
+      const wx  = mr.x + ((ni % GRID_W) + 0.5) / GRID_W * mr.w;
+      const wy  = mr.y + (Math.floor(ni / GRID_W) + 0.5) / GRID_H * mr.h;
+      for (let k = 0; k < count; k++) {
+        particlesRef.current.push({
+          x: cam.x + wx * cam.zoom, y: cam.y + wy * cam.zoom,
+          vx: (Math.random() - 0.5) * 1.5, vy: (Math.random() - 0.5) * 1.5,
+          life: 1, color: col,
+        });
+      }
+    };
+
+    // Helper: check if an owner just got eliminated
+    const checkElimination = (lostOwnerIdx: number, killerOwnerIdx: number) => {
+      if (eliminatedRef.current.has(lostOwnerIdx)) return;
+      let survived = false;
+      for (let k = 0; k < grid.length; k++) if (grid[k] === lostOwnerIdx) { survived = true; break; }
+      if (!survived) {
+        eliminatedRef.current.add(lostOwnerIdx);
+        const killerEntry = [...playerIndexRef.current.entries()].find(([, v]) => v === killerOwnerIdx);
+        if (killerEntry) {
+          const killer = playersRef.current.get(killerEntry[0]);
+          if (killer) {
+            killer.coins = (killer.coins || 0) + 500;
+            supabase.from("lobby_players").update({ coins: killer.coins }).eq("lobby_id", lobby.id).eq("player_id", killerEntry[0]);
+            if (killerEntry[0] === playerId) notify("Enemy eliminated! +500 coins", "success");
+          }
+        }
+        const myIdx = playerIndexRef.current.get(playerId);
+        if (lostOwnerIdx === myIdx) setIsDead(true);
+      }
+    };
+
+    // Build a list of all active attacks this tick
+    type ActiveAttack = { target: AttackTarget; player: LobbyPlayer; pid: string; deployFrac: number };
+    const activeAttacks: ActiveAttack[] = [];
+
+    if (myTarget) {
+      const player = playersRef.current.get(playerId);
+      if (player && player.alive) {
+        activeAttacks.push({ target: myTarget, player, pid: playerId, deployFrac: deployPctRef.current / 100 });
+      }
+    }
+    botTargets.forEach((t, ownerIdx) => {
+      const entry = [...playerIndexRef.current.entries()].find(([, v]) => v === ownerIdx);
+      if (!entry) return;
+      const player = playersRef.current.get(entry[0]);
+      if (player && player.alive) activeAttacks.push({ target: t, player, pid: entry[0], deployFrac: 0.55 });
+    });
+
+    // For each active attack: iterate the grid and push the front
+    for (const { target, player, deployFrac } of activeAttacks) {
+      const o = target.ownerIdx;
+      if (player.units < 1) continue;
+
+      const deployedUnits = player.units * deployFrac;
+      // Attack rate: probability per border tile per tick
+      // At UNIT_SCALE_BASE deployed units: base rate × uMult
+      // This means at 500 deployed infantry, each border tile near the target
+      // has ATTACK_SPREAD_BASE chance to flip per 16ms (~1-2 tiles/sec total)
+      const uMult = UNIT_MULT[target.unitType];
+      const unitScale = Math.max(0.05, deployedUnits / UNIT_SCALE_BASE);
+      const flipChance = ATTACK_SPREAD_BASE * unitScale * uMult * (dt / 16.67);
+
+      const tx = target.targetIdx % GRID_W;
+      const ty = Math.floor(target.targetIdx / GRID_W);
+
+      for (let i = 0; i < grid.length; i++) {
+        if (grid[i] !== o) continue;
+        if (str[i] < 0.5) continue;
+        if (player.units < 1) break; // ran out of troops, stop attacking
+
+        const x = i % GRID_W, y = Math.floor(i / GRID_W);
+
+        // Only process tiles that are on the border (have a non-owned neighbor that's land)
+        // AND are within striking distance of the target direction
+        // Collect candidate enemy/neutral neighbors
+        const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]] as const;
+        const candidates: { ni: number; score: number }[] = [];
+        for (const [dx, dy] of dirs) {
+          const nx = x + dx, ny = y + dy;
+          if (nx < 0 || ny < 0 || nx >= GRID_W || ny >= GRID_H) continue;
+          const ni = ny * GRID_W + nx;
+          if (!mask[ni] || grid[ni] === o) continue;
+          // Score: how much closer does this get us to the target?
+          const curDist  = Math.abs(x - tx) + Math.abs(y - ty);
+          const nextDist = Math.abs(nx - tx) + Math.abs(ny - ty);
+          // Heavily favor directions toward target (6× weight for tiles that close distance)
+          const score = nextDist < curDist ? 1 : nextDist === curDist ? 4 : 12;
+          candidates.push({ ni, score });
+        }
+        if (candidates.length === 0) continue;
+
+        // Roll flip chance — weighted toward target direction
+        // We pick ONE candidate per border tile per tick at most
+        const totalWeight = candidates.reduce((s, c) => s + 1 / c.score, 0);
+        const r = Math.random();
+        if (r > flipChance) continue; // didn't trigger this tick
+
+        // Pick candidate weighted by score (lower score = higher weight)
+        let pick = candidates[0].ni;
+        {
+          let acc = 0;
+          const pickRoll = Math.random() * totalWeight;
+          for (const c of candidates) {
+            acc += 1 / c.score;
+            if (pickRoll <= acc) { pick = c.ni; break; }
+          }
+        }
+
+        const ni = pick;
+        const no = grid[ni];
+
+        const hasFort    = blds.some(b => b.gridIdx === ni && b.type === "fort");
+        const hasDefPost = blds.some(b => b.gridIdx === ni && b.type === "defense_post");
+        const defMult    = hasFort ? FORT_DEFENSE : hasDefPost ? DEFPOST_MULT : 1.0;
+
+        if (no < 0) {
+          // ── Neutral tile: always claim, small unit cost ────────────────
+          grid[ni] = o;
+          str[ni]  = Math.min(MAX_STRENGTH, str[i] * 0.5 + 5);
+          claims.push({ i: ni, o, s: str[ni] });
+          player.units = Math.max(0, player.units - FLIP_COST_NEUTRAL);
+          spawnParticles(ni, o, 1);
+
+        } else {
+          // ── Enemy tile: fight based on strength + defMult ─────────────
+          const atkStr = str[i] * uMult;
+          const defStr = str[ni] * defMult;
+
+          if (atkStr > defStr) {
+            // Win: flip the tile
+            grid[ni] = o;
+            str[ni]  = Math.max(1, (atkStr - defStr) * 0.4);
+            // Attacker pays cost proportional to defender strength
+            const atkCost = Math.max(FLIP_COST_ENEMY_BASE, Math.round(FLIP_COST_ENEMY_BASE * defMult));
+            player.units = Math.max(0, player.units - atkCost);
+            // Defender also loses units
+            const defEntry = [...playerIndexRef.current.entries()].find(([, v]) => v === no);
+            if (defEntry) {
+              const defPlayer = playersRef.current.get(defEntry[0]);
+              if (defPlayer) defPlayer.units = Math.max(0, defPlayer.units - FLIP_COST_DEFENDER);
+            }
+            claims.push({ i: ni, o, s: str[ni] });
+            spawnParticles(ni, o, 3);
+            checkElimination(no, o);
+            blds.forEach(b => { if (b.gridIdx === ni && o >= 0) b.ownerIdx = o; });
+
+          } else {
+            // Lose: attacker tile loses some strength, attacker pays a smaller unit cost
+            str[i] = Math.max(0, str[i] - defStr * 0.08);
+            player.units = Math.max(0, player.units - Math.ceil(FLIP_COST_ENEMY_BASE * 0.4));
+          }
+        }
+      }
+    }
+
+    if (claims.length > 0) {
+      for (let ci = 0; ci < claims.length; ci += 60) {
+        channelRef.current?.send({ type: "broadcast", event: "claim", payload: claims.slice(ci, ci + 60) });
+      }
+    }
+  }
+
   // ─── Render + sim loop ────────────────────────────────────────────────────
   useEffect(() => {
     const canvas = canvasRef.current, container = containerRef.current;
@@ -275,163 +471,6 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     }
     resize();
     const ro = new ResizeObserver(resize); ro.observe(container);
-
-    // ── Pressure simulation tick ──────────────────────────────────────────
-    // OpenFront-style: each tick, each border cell has a chance to flip an adjacent
-    // non-owned cell. The attack target biases WHICH direction is chosen.
-    // "Attack ratio" controls how many troops are consumed per flip = how fast you spread.
-    function tickPressure(dt: number) {
-      const mask = landMaskRef.current; if (!mask) return;
-      const grid = ownerGridRef.current;
-      const str  = strengthGridRef.current;
-      const blds = buildingsRef.current;
-      const myTarget  = myTargetRef.current;
-      const botTargets = botTargetsRef.current;
-
-      // Regen: owned tiles fill toward MAX_STRENGTH
-      const regenMult = DIFFICULTY_REGEN[lobby.difficulty] ?? 1;
-      for (let i = 0; i < grid.length; i++) {
-        if (grid[i] < 0) continue;
-        str[i] = Math.min(MAX_STRENGTH, str[i] + REGEN_RATE * regenMult * dt * 0.06);
-      }
-
-      // Build border-tile lists per player (only tiles adjacent to non-owned land)
-      // We'll collect all owned border tiles then process them
-      const claims: { i: number; o: number; s: number }[] = [];
-      const mr  = mapRectRef.current;
-      const cam = camRef.current;
-
-      // Shuffle order each tick so no directional bias from array order
-      const indices = Array.from({ length: grid.length }, (_, i) => i);
-      // Fisher-Yates partial shuffle (just randomize which we visit first)
-      for (let k = indices.length - 1; k > 0; k--) {
-        const j = Math.floor(Math.random() * (k + 1));
-        [indices[k], indices[j]] = [indices[j], indices[k]];
-      }
-
-      const flipped = new Set<number>();
-
-      for (const i of indices) {
-        const o = grid[i]; if (o < 0 || str[i] < 1) continue;
-
-        // Get this player's target
-        let target: AttackTarget | null = null;
-        if (myTarget && myTarget.ownerIdx === o) target = myTarget;
-        else if (botTargets.has(o)) target = botTargets.get(o)!;
-
-        const uMult = target ? UNIT_MULT[target.unitType] : 1.0;
-        const spreadChance = target ? ATTACK_SPREAD_CHANCE : PASSIVE_SPREAD_CHANCE;
-
-        const x = i % GRID_W, y = Math.floor(i / GRID_W);
-
-        // Collect candidate neighbors
-        const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]] as const;
-        let candidates: { ni: number; dx: number; dy: number }[] = [];
-
-        for (const [dx, dy] of dirs) {
-          const nx = x + dx, ny = y + dy;
-          if (nx < 0 || ny < 0 || nx >= GRID_W || ny >= GRID_H) continue;
-          const ni = ny * GRID_W + nx;
-          if (!mask[ni]) continue;
-          if (grid[ni] === o) continue;
-          if (flipped.has(ni)) continue;
-          candidates.push({ ni, dx, dy });
-        }
-        if (candidates.length === 0) continue;
-
-        // Bias candidates toward target if set
-        if (target) {
-          const tx = target.targetIdx % GRID_W, ty = Math.floor(target.targetIdx / GRID_W);
-          const myDist = Math.abs(x - tx) + Math.abs(y - ty);
-          // Weight: dirs that reduce distance get PUSH_BOOST weight
-          const weighted: { ni: number }[] = [];
-          for (const c of candidates) {
-            const ndist = Math.abs((x + c.dx) - tx) + Math.abs((y + c.dy) - ty);
-            const w = ndist < myDist ? 6 : 1; // 6x more likely to go toward target
-            for (let w2 = 0; w2 < w; w2++) weighted.push(c);
-          }
-          candidates = weighted;
-        }
-
-        // Roll spread chance (scaled by dt and unit multiplier)
-        const roll = Math.random();
-        if (roll > spreadChance * uMult * (dt / 16.67)) continue;
-
-        // Pick random candidate (already weighted toward target)
-        const chosen = candidates[Math.floor(Math.random() * candidates.length)];
-        const ni = chosen.ni;
-        const no = grid[ni];
-
-        const hasFort    = blds.some(b => b.gridIdx === ni && b.type === "fort");
-        const hasDefPost = blds.some(b => b.gridIdx === ni && b.type === "defense_post");
-        const defMult    = hasFort ? FORT_DEFENSE : hasDefPost ? DEFPOST_MULT : 1.0;
-
-        if (no < 0) {
-          // Claim neutral tile — always succeeds
-          grid[ni] = o;
-          str[ni]  = Math.max(1, str[i] * 0.4);
-          flipped.add(ni);
-          claims.push({ i: ni, o, s: str[ni] });
-
-          // Particle
-          const wx2 = mr.x + ((ni % GRID_W) + 0.5) / GRID_W * mr.w;
-          const wy2 = mr.y + (Math.floor(ni / GRID_W) + 0.5) / GRID_H * mr.h;
-          const col2 = colorsRef.current[o] ? `rgb(${colorsRef.current[o].join(",")})` : "#fff";
-          particlesRef.current.push({ x: cam.x + wx2 * cam.zoom, y: cam.y + wy2 * cam.zoom, vx: (Math.random() - 0.5) * 0.5, vy: (Math.random() - 0.5) * 0.5, life: 0.8, color: col2 });
-        } else {
-          // Contest enemy tile — compare strengths
-          const attackPow = str[i] * 0.15 * uMult;
-          const defendPow = str[ni] * 0.15 * defMult;
-          if (attackPow > defendPow || Math.random() < 0.05) {
-            // Win: flip tile
-            grid[ni] = o;
-            str[ni]  = Math.max(1, attackPow - defendPow);
-            flipped.add(ni);
-            claims.push({ i: ni, o, s: str[ni] });
-
-            const wx2 = mr.x + ((ni % GRID_W) + 0.5) / GRID_W * mr.w;
-            const wy2 = mr.y + (Math.floor(ni / GRID_W) + 0.5) / GRID_H * mr.h;
-            const col2 = colorsRef.current[o] ? `rgb(${colorsRef.current[o].join(",")})` : "#fff";
-            for (let pi = 0; pi < 3; pi++) {
-              particlesRef.current.push({ x: cam.x + wx2 * cam.zoom, y: cam.y + wy2 * cam.zoom, vx: (Math.random() - 0.5) * 1.2, vy: (Math.random() - 0.5) * 1.2, life: 1, color: col2 });
-            }
-
-            // Check elimination
-            const prevOwner = no;
-            if (!eliminatedRef.current.has(prevOwner)) {
-              let survived = false;
-              for (let k = 0; k < grid.length; k++) if (grid[k] === prevOwner) { survived = true; break; }
-              if (!survived) {
-                eliminatedRef.current.add(prevOwner);
-                const killerPid = [...playerIndexRef.current.entries()].find(([, v]) => v === o)?.[0];
-                if (killerPid) {
-                  const killer = playersRef.current.get(killerPid);
-                  if (killer) {
-                    killer.coins = (killer.coins || 0) + 500;
-                    supabase.from("lobby_players").update({ coins: killer.coins }).eq("lobby_id", lobby.id).eq("player_id", killerPid);
-                    if (killerPid === playerId) notify("Enemy eliminated! +500 coins", "success");
-                  }
-                }
-                const myIdx = playerIndexRef.current.get(playerId);
-                if (prevOwner === myIdx) setIsDead(true);
-              }
-            }
-
-            // Transfer building
-            blds.forEach(b => { if (b.gridIdx === ni && o >= 0) b.ownerIdx = o; });
-          } else {
-            // Lose: attacker tile weakens slightly
-            str[i] = Math.max(0, str[i] - defendPow * 0.05);
-          }
-        }
-      }
-
-      if (claims.length > 0) {
-        for (let ci = 0; ci < claims.length; ci += 60) {
-          channelRef.current?.send({ type: "broadcast", event: "claim", payload: claims.slice(ci, ci + 60) });
-        }
-      }
-    }
 
     // ── Sync to DB ────────────────────────────────────────────────────────
     async function syncStats() {
@@ -562,14 +601,13 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         ctx.strokeRect(mx + x * cellW + 0.5, my + y * cellH + 0.5, cellW - 1, cellH - 1);
       }
 
-      // Attack target indicator — small pulsing dot on target, NO big circle
+      // Attack target crosshair
       const myTarget = myTargetRef.current;
       if (myTarget) {
         const ptx = mx + (myTarget.targetIdx % GRID_W + 0.5) * cellW;
         const pty = my + (Math.floor(myTarget.targetIdx / GRID_W) + 0.5) * cellH;
         const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 200);
         ctx.save();
-        // Small cross-hair style target marker
         ctx.strokeStyle = `rgba(255,255,100,${0.6 + pulse * 0.4})`;
         ctx.lineWidth = 1.5;
         ctx.beginPath();
@@ -587,7 +625,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         drawBldIcon(mx + (b.gridIdx % GRID_W) / GRID_W * mw + cellW / 2, my + Math.floor(b.gridIdx / GRID_W) / GRID_H * mh + cellH / 2, b.type, col, cam.zoom);
       });
 
-      // Ships — draw as a boat icon traveling across ocean
+      // Ships
       shipsRef.current.forEach(ship => {
         const sx = ship.fromX + (ship.toX - ship.fromX) * ship.progress;
         const sy = ship.fromY + (ship.toY - ship.fromY) * ship.progress;
@@ -596,14 +634,11 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         const angle = Math.atan2(ship.toY - ship.fromY, ship.toX - ship.fromX);
         ctx.save();
         ctx.translate(sx, sy); ctx.rotate(angle);
-        // Hull
         ctx.fillStyle = col; ctx.strokeStyle = "rgba(255,255,255,0.8)"; ctx.lineWidth = 0.8;
         ctx.beginPath(); ctx.ellipse(0, 0, 7, 3.5, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
-        // Wake lines behind
         ctx.globalAlpha = 0.25; ctx.strokeStyle = "#aef"; ctx.lineWidth = 1.2;
         ctx.beginPath(); ctx.moveTo(-9, 2); ctx.lineTo(-18, 4); ctx.moveTo(-9, -2); ctx.lineTo(-18, -4); ctx.stroke();
         ctx.restore();
-        // Troop count above ship
         ctx.save();
         ctx.fillStyle = "#fff"; ctx.font = `bold ${Math.max(7, 9 * cam.zoom)}px monospace`;
         ctx.textAlign = "center"; ctx.textBaseline = "middle";
@@ -632,14 +667,14 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
 
       ctx.restore(); // end camera
 
-      // Particles (screen-space)
+      // Particles
       for (const p of particlesRef.current) {
         ctx.globalAlpha = p.life * 0.75; ctx.fillStyle = p.color;
         ctx.beginPath(); ctx.arc(p.x, p.y, 1 + p.life * 2, 0, Math.PI * 2); ctx.fill();
       }
       ctx.globalAlpha = 1;
 
-      // Mode hint — top center
+      // Mode hint
       if (placeModeRef.current || bombModeRef.current) {
         ctx.save(); ctx.font = `${14 * devicePixelRatio}px sans-serif`;
         ctx.fillStyle = "rgba(255,255,100,0.9)"; ctx.textAlign = "center";
@@ -657,7 +692,6 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     function loop(now: number) {
       const dt = Math.min(now - lastFrame, 100); lastFrame = now;
 
-      // WASD + Arrow keys camera pan
       const cam = camRef.current; const ks = keysRef.current;
       if (ks.has("w") || ks.has("arrowup"))    cam.y += 5;
       if (ks.has("s") || ks.has("arrowdown"))  cam.y -= 5;
@@ -666,29 +700,23 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
 
       tickPressure(dt);
 
-      // Ships — move at speed proportional to actual tile distance
+      // Ships
       const navalBoost = new Set(buildingsRef.current.filter(b => b.type === "naval_base").map(b => b.ownerIdx));
       shipsRef.current = shipsRef.current.filter(ship => {
         const speed = SHIP_TILES_PER_MS / Math.max(1, ship.distanceTiles) * (navalBoost.has(ship.ownerIdx) ? 1.7 : 1);
         ship.progress = Math.min(1, ship.progress + speed * dt);
         if (ship.progress >= 1) {
-          // Land troops ONLY on coastline tiles near target
           const mask2 = landMaskRef.current; const coast2 = coastMaskRef.current;
           if (mask2 && coast2) {
             const gr = ownerGridRef.current, st = strengthGridRef.current;
             const ltx = ship.targetGridIdx % GRID_W, lty = Math.floor(ship.targetGridIdx / GRID_W);
-            // Seed only coastal tiles in landing radius
             for (let dy = -4; dy <= 4; dy++) for (let dx = -4; dx <= 4; dx++) {
               if (Math.abs(dx) + Math.abs(dy) > 4) continue;
               const nx = ltx + dx, ny = lty + dy;
               if (nx < 0 || ny < 0 || nx >= GRID_W || ny >= GRID_H) continue;
               const ni = ny * GRID_W + nx;
-              // Only land on coastal or land tiles (not deep ocean), don't overwrite own tiles
               if (!mask2[ni]) continue;
-              if (gr[ni] !== ship.ownerIdx) {
-                gr[ni] = ship.ownerIdx;
-                st[ni] = Math.min(MAX_STRENGTH, Math.max(5, ship.units * 0.15));
-              }
+              if (gr[ni] !== ship.ownerIdx) { gr[ni] = ship.ownerIdx; st[ni] = Math.min(MAX_STRENGTH, Math.max(5, ship.units * 0.15)); }
             }
           }
           return false;
@@ -792,9 +820,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     function onMouseUp() { dragRef.current.active = false; }
     function onKeyDown(e: KeyboardEvent) {
       keysRef.current.add(e.key.toLowerCase());
-      // Shortcuts
       if (e.key === "c" || e.key === "C") {
-        // Center on own territory
         const myIdx = playerIndexRef.current.get(playerId); if (myIdx === undefined) return;
         const gr = ownerGridRef.current; let sx = 0, sy = 0, cnt = 0;
         for (let i = 0; i < gr.length; i++) if (gr[i] === myIdx) { sx += i % GRID_W; sy += Math.floor(i / GRID_W); cnt++; }
@@ -810,21 +836,15 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         myTargetRef.current = null;
         setAttackTarget(null);
       }
-      // Number keys 1-8 for buildings
       const num = parseInt(e.key);
       if (num >= 1 && num <= 8) {
         const toolbar: BuildingType[] = ["city", "factory", "port", "naval_base", "defense_post", "fort", "missile_silo", "sam_launcher"];
         const btype = toolbar[num - 1];
         if (btype) {
-          if (placeModeRef.current?.type === btype) {
-            setPlaceMode(null); placeModeRef.current = null;
-          } else {
-            setPlaceMode({ type: btype }); placeModeRef.current = { type: btype };
-            setBombMode(null); bombModeRef.current = null;
-          }
+          if (placeModeRef.current?.type === btype) { setPlaceMode(null); placeModeRef.current = null; }
+          else { setPlaceMode({ type: btype }); placeModeRef.current = { type: btype }; setBombMode(null); bombModeRef.current = null; }
         }
       }
-      // Q/E for unit type
       if (e.key === "q" || e.key === "Q") { setUnitType("infantry"); unitTypeRef.current = "infantry"; }
       if (e.key === "e" || e.key === "E") { setUnitType("tank"); unitTypeRef.current = "tank"; }
       if (e.key === "r" || e.key === "R") { setUnitType("warship"); unitTypeRef.current = "warship"; }
@@ -866,23 +886,20 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
 
   // ── Set attack target ─────────────────────────────────────────────────────
   function setMyTarget(targetIdx: number, ownerIdx: number, targetName?: string) {
-    const myIdx = playerIndexRef.current.get(playerId);
-    if (myIdx === undefined) return;
+    const myIdx = playerIndexRef.current.get(playerId); if (myIdx === undefined) return;
     const target: AttackTarget = { ownerIdx, targetIdx, unitType: unitTypeRef.current };
     myTargetRef.current = target;
     channelRef.current?.send({ type: "broadcast", event: "target", payload: target });
     setAttackTarget(targetName ? { name: targetName } : null);
   }
 
-  // ── Naval attack — only valid target is enemy/neutral COASTLINE ───────────
+  // ── Naval attack ──────────────────────────────────────────────────────────
   function launchShip(targetIdx: number, ownerIdx: number, ownerPid: string) {
     const coast = coastMaskRef.current; if (!coast) return;
-    // Target must be a coast or land tile — ships attack coastlines
     const mask = landMaskRef.current;
     if (!mask || !mask[targetIdx]) { notify("Ships can only attack land tiles", "error"); return; }
 
     const grid = ownerGridRef.current;
-    // Find nearest OWN coastal tile as departure point
     let bestFrom = -1, bestDist = Infinity;
     for (let i = 0; i < grid.length; i++) {
       if (grid[i] !== ownerIdx || !coast[i]) continue;
@@ -891,12 +908,8 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     }
     if (bestFrom === -1) { notify("Need a coastal tile to launch ships", "error"); return; }
 
-    // Find nearest ENEMY/NEUTRAL coastal tile to the target as actual landing point
     let landingIdx = targetIdx;
-    if (coast[targetIdx]) {
-      landingIdx = targetIdx; // already coastal, good
-    } else {
-      // Find nearest coastal tile to the clicked land tile
+    if (!coast[targetIdx]) {
       let nearestCoast = -1, nearestDist = Infinity;
       const tx = targetIdx % GRID_W, ty = Math.floor(targetIdx / GRID_W);
       for (let i = 0; i < coast.length; i++) {
@@ -909,7 +922,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
 
     const mr = mapRectRef.current, cW = mr.w / GRID_W, cH = mr.h / GRID_H;
     const me = playersRef.current.get(ownerPid); if (!me) return;
-    const sendUnits = Math.max(1, Math.floor(me.units * sendPctRef.current / 100));
+    const sendUnits = Math.max(1, Math.floor(me.units * deployPctRef.current / 100));
     const dist = Math.abs(bestFrom % GRID_W - landingIdx % GRID_W) + Math.abs(Math.floor(bestFrom / GRID_W) - Math.floor(landingIdx / GRID_W));
 
     const ship: Ship = {
@@ -1014,18 +1027,15 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     const i = gy * GRID_W + gx;
     const mask = landMaskRef.current; if (!mask) return;
 
-    // Bomb mode
     if (bombModeRef.current) {
       dropBomb(i, bombModeRef.current, playerId);
       setBombMode(null); bombModeRef.current = null; return;
     }
-    // Place mode
     if (placeModeRef.current) {
       if (!mask[i]) { notify("Click on land", "error"); return; }
       doPlaceBuilding(gx, gy, placeModeRef.current.type); return;
     }
 
-    // No territory yet — spawn
     const grid = ownerGridRef.current;
     let hasTerritory = false;
     for (let k = 0; k < grid.length; k++) if (grid[k] === myIdx) { hasTerritory = true; break; }
@@ -1036,7 +1046,6 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
       notify("Empire founded! Click enemy territory to attack.", "success"); return;
     }
 
-    // Click on own territory — cancel attack target
     if (grid[i] === myIdx) {
       myTargetRef.current = null;
       setAttackTarget(null);
@@ -1045,7 +1054,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
 
     if (!mask[i]) { notify("Click on land", "error"); return; }
 
-    // Check if target is reachable by land
+    // Check land reachability
     let reachable = false;
     {
       const reach = new Uint8Array(grid.length); const q: number[] = [];
@@ -1073,7 +1082,6 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     }
 
     if (reachable) {
-      // Set land attack target
       const targetOwnerIdx = grid[i];
       let targetName: string | undefined;
       if (targetOwnerIdx >= 0) {
@@ -1082,25 +1090,20 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
       }
       setMyTarget(i, myIdx, targetName);
       if (targetName) notify(`Attacking ${targetName}!`, "info");
+      else notify("Pushing into neutral territory", "info");
     } else {
-      // Not reachable by land — try naval
       const hasPort = buildingsRef.current.some(b => b.ownerIdx === myIdx && b.type === "port");
-      if (hasPort) {
-        launchShip(i, myIdx, playerId);
-      } else {
-        notify("No land path — build a Port for naval attacks", "error");
-      }
+      if (hasPort) launchShip(i, myIdx, playerId);
+      else notify("No land path — build a Port for naval attacks", "error");
     }
   }
 
-  // ── Right click — cancel current action or open context for building ──────
   function handleContextMenu(e: React.MouseEvent) {
     e.preventDefault();
     if (placeModeRef.current || bombModeRef.current) {
       setPlaceMode(null); setBombMode(null);
       placeModeRef.current = null; bombModeRef.current = null; return;
     }
-    // Cancel attack target
     if (myTargetRef.current) {
       myTargetRef.current = null;
       setAttackTarget(null); return;
@@ -1114,7 +1117,6 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
   const hasSilo = myIdx !== undefined && buildingsRef.current.some(b => b.ownerIdx === myIdx && b.type === "missile_silo");
   const TOOLBAR: BuildingType[] = ["city", "factory", "port", "naval_base", "defense_post", "fort", "missile_silo", "sam_launcher"];
 
-  // ── Game Over ─────────────────────────────────────────────────────────────
   if (isDead && !isSpectating) {
     return (
       <div className="relative h-screen w-screen overflow-hidden bg-[#0a1628] flex items-center justify-center">
@@ -1250,7 +1252,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
             )}
             <div className="h-8 w-px bg-border" />
 
-            {/* Unit type — Q/E/R shortcuts */}
+            {/* Unit type */}
             <div className="flex flex-col items-center gap-0.5">
               <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Unit [Q/E/R]</span>
               <div className="flex gap-1">
@@ -1271,15 +1273,21 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
             </div>
             <div className="h-8 w-px bg-border" />
 
-            {/* Attack ratio slider */}
+            {/* Deploy % slider — this actually controls attack speed now */}
             <div className="flex flex-col items-center gap-0.5">
-              <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Attack Ratio</span>
+              <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                Deploy % <span className="text-primary">{deployPct}%</span>
+              </span>
               <div className="flex items-center gap-1.5">
-                <input type="range" min={5} max={100} step={5} value={sendPct}
-                  onChange={e => { setSendPct(+e.target.value); sendPctRef.current = +e.target.value; }}
+                <span className="text-[9px] text-muted-foreground">slow</span>
+                <input type="range" min={5} max={100} step={5} value={deployPct}
+                  onChange={e => { setDeployPct(+e.target.value); deployPctRef.current = +e.target.value; }}
                   className="w-24 accent-primary" />
-                <span className="w-10 text-right font-mono text-xs font-bold text-primary">{sendPct}%</span>
+                <span className="text-[9px] text-muted-foreground">fast</span>
               </div>
+              <span className="text-[9px] text-muted-foreground/60">
+                {Math.round((me?.units ?? 0) * deployPct / 100)} units on front
+              </span>
             </div>
             <div className="h-8 w-px bg-border" />
 
@@ -1309,7 +1317,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
             <div className="h-8 w-px bg-border" />
             <div className="text-[9px] text-muted-foreground leading-tight">
               <div>WASD/Arrows: pan</div>
-              <div>Esc: cancel</div>
+              <div>Esc: cancel attack</div>
               <div>1-8: buildings</div>
             </div>
           </div>
