@@ -875,8 +875,40 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     const isLand = mask ? !!mask[i] : false;
     const nearOwnPort = myIdx !== undefined && isNearPort(buildingsRef.current, i, myIdx);
 
-    setCtxMenu({ screenX: e.clientX, screenY: e.clientY, gx, gy, isOwnTerritory, isLand, nearOwnPort });
+    // Find nearest enemy dot within ~6 grid cells for alliance proposals
+    let enemyPlayerId: string | null = null;
+    let bestD = 6;
+    playersRef.current.forEach((p) => {
+      if (p.player_id === playerId || !p.alive) return;
+      const px = p.dot_x * GRID_W;
+      const py = p.dot_y * GRID_H;
+      const d = Math.hypot(px - gx, py - gy);
+      if (d < bestD) { bestD = d; enemyPlayerId = p.player_id; }
+    });
+
+    setCtxMenu({ screenX: e.clientX, screenY: e.clientY, gx, gy, isOwnTerritory, isLand, nearOwnPort, enemyPlayerId });
   }
+
+  // Alliance helpers
+  function proposeAlliance(targetId: string) {
+    setCtxMenu(null);
+    channelRef.current?.send({ type: "broadcast", event: "alliance", payload: { from: playerId, to: targetId, action: "propose" } });
+    showNotif("Alliance proposed");
+  }
+  function acceptAlliance(targetId: string) {
+    setCtxMenu(null);
+    setAllies((prev) => prev.includes(targetId) ? prev : [...prev, targetId]);
+    setPendingAlliances((prev) => prev.filter((x) => x !== targetId));
+    channelRef.current?.send({ type: "broadcast", event: "alliance", payload: { from: playerId, to: targetId, action: "accept" } });
+    showNotif("Alliance formed");
+  }
+  function breakAlliance(targetId: string) {
+    setCtxMenu(null);
+    setAllies((prev) => prev.filter((x) => x !== targetId));
+    channelRef.current?.send({ type: "broadcast", event: "alliance", payload: { from: playerId, to: targetId, action: "break" } });
+    showNotif("Alliance broken");
+  }
+
 
   // Attack from context menu
   async function doAttack(gx: number, gy: number) {
