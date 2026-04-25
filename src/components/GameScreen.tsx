@@ -401,7 +401,8 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     const ro = new ResizeObserver(resize);
     ro.observe(container);
 
-    const speed = DIFFICULTY_SPEED[lobby.difficulty] ?? 1;
+    // Per-player accumulated unit cost from the current attack pulse
+    const pulseSpend = new Map<string, number>();
 
     function simulate(dt: number) {
       const mask = landMaskRef.current;
@@ -411,24 +412,51 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
       if (colors.length === 0) return;
       const blds = buildingsRef.current;
 
+      const now = performance.now();
+      // Pulse cooldown progress (used by UI)
+      const since = now - lastAttackRef.current;
+      const progress = Math.min(1, since / ATTACK_INTERVAL_MS);
+      // throttle React updates
+      if (Math.abs(progress - attackCooldown) > 0.05) setAttackCooldown(progress);
+      if (since < ATTACK_INTERVAL_MS) return;
+      lastAttackRef.current = now;
+      pulseSpend.clear();
+
       const claims: { i: number; o: number }[] = [];
+      const ally = alliesRef.current;
+      const myPid = playerId;
+      const localAuto = autoModeRef.current;
+
       playersRef.current.forEach((p) => {
         if (!p.alive) return;
         const myIdx = playerIndexRef.current.get(p.player_id);
         if (myIdx === undefined) return;
 
-        const strength = Math.min(80, (p.units / 20) * speed * (dt / 1000) * 30);
+        // Human in manual mode does NOT auto-expand — only attacks via context menu
+        if (p.player_id === myPid && !localAuto) return;
+
+        // Strength scales with army size, but is much gentler than before.
+        // Also capped so big empires don't snowball as fast.
+        const sizeFactor = Math.sqrt(Math.max(1, p.units)) / 6;
+        const strength = Math.min(14, sizeFactor * speed);
+        // Each "attempt" is one tile-claim attempt that costs COST_PER_CLAIM units on success
         const attempts = Math.floor(strength) + (Math.random() < strength % 1 ? 1 : 0);
         if (attempts <= 0) return;
+
+        // How many units this player can spend this pulse (cap at 30% of army)
+        const budget = Math.max(1, Math.floor(p.units * 0.3));
+        let spent = 0;
 
         const dotX = Math.floor(p.dot_x * GRID_W);
         const dotY = Math.floor(p.dot_y * GRID_H);
 
         for (let a = 0; a < attempts; a++) {
+          if (spent >= budget) break;
           let sx: number, sy: number;
-          if (Math.random() < 0.25) {
-            sx = dotX + Math.floor((Math.random() - 0.5) * 10);
-            sy = dotY + Math.floor((Math.random() - 0.5) * 10);
+          if (Math.random() < 0.5) {
+            // Expand from near the dot — feels like troops marching from the leader
+            sx = dotX + Math.floor((Math.random() - 0.5) * 8);
+            sy = dotY + Math.floor((Math.random() - 0.5) * 8);
           } else {
             let found = -1;
             for (let t = 0; t < 40; t++) {
@@ -439,7 +467,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
             sx = found % GRID_W;
             sy = Math.floor(found / GRID_W);
           }
-          const dirs = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[-1,-1],[1,-1],[-1,1]];
+          const dirs = [[1,0],[-1,0],[0,1],[0,-1]];
           const d = dirs[Math.floor(Math.random() * dirs.length)];
           const nx = sx + d[0]; const ny = sy + d[1];
           if (nx < 0 || ny < 0 || nx >= GRID_W || ny >= GRID_H) continue;
@@ -447,17 +475,38 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
           if (!mask[ni]) continue;
           const cur = grid[ni];
           if (cur === myIdx) continue;
+          // Don't claim allied tiles (only check from human player's POV; bots ignore)
+          if (cur >= 0 && p.player_id === myPid) {
+            const enemyEntry = [...playerIndexRef.current.entries()].find(([, v]) => v === cur);
+            if (enemyEntry && ally.includes(enemyEntry[0])) continue;
+          }
           if (cur === -1) {
             grid[ni] = myIdx;
             claims.push({ i: ni, o: myIdx });
+            spent += COST_PER_CLAIM;
           } else {
             const defEntry = [...playerIndexRef.current.entries()].find(([, v]) => v === cur);
             const def = defEntry ? playersRef.current.get(defEntry[0]) : null;
             if (!def) continue;
-            // Check for fort on this tile
             const hasFort = blds.some((b) => b.type === "fort" && b.gridIdx === ni);
             const defBonus = hasFort ? FORT_DEFENSE : 1;
-            if (p.units > def.units * 1.4 * defBonus && Math.random() < 0.25) {
+            if (p.units > def.units * 1.4 * defBonus && Math.random() < 0.18) {
+              grid[ni] = myIdx;
+              claims.push({ i: ni, o: myIdx });
+              spent += COST_PER_CLAIM * 2; // contested tiles cost more
+            }
+          }
+        }
+        if (spent > 0) pulseSpend.set(p.player_id, spent);
+      });
+
+      // Apply unit drain to local mirror (DB sync happens in syncStats)
+      pulseSpend.forEach((cost, pid) => {
+        const pl = playersRef.current.get(pid);
+        if (pl) pl.units = Math.max(0, pl.units - Math.round(cost));
+      });
+
+
               grid[ni] = myIdx;
               claims.push({ i: ni, o: myIdx });
             }
