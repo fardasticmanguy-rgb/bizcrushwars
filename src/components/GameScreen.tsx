@@ -26,11 +26,11 @@ type Building = { type: BuildingType; ownerIdx: number; gridIdx: number };
 type BombType = "atom" | "hydrogen" | "dirty";
 type UnitType = "infantry" | "tank" | "warship";
 
-// Active pressure push — player clicked a target, pressure flows toward it
-type ActivePush = {
+// Attack target — player right-clicked an enemy, border expands toward them
+// This is persistent (not draining) — it biases the spread direction until cancelled or new target set
+type AttackTarget = {
   ownerIdx: number;
-  targetIdx: number;
-  strength: number;   // budget remaining
+  targetIdx: number;  // grid cell being attacked toward
   unitType: UnitType;
 };
 
@@ -38,15 +38,10 @@ type Ship = {
   id: string; ownerIdx: number;
   fromX: number; fromY: number; toX: number; toY: number;
   units: number; targetGridIdx: number; progress: number;
+  distanceTiles: number; // actual manhattan distance for speed calc
 };
 
 type RadZone = { gridIdx: number; strength: number; decay: number };
-
-type RadialMenu = {
-  screenX: number; screenY: number; gx: number; gy: number;
-  isOwnTerritory: boolean; isLand: boolean; isCoast: boolean;
-  isEnemy: boolean; hasBuilding: boolean;
-} | null;
 
 type PlaceMode = { type: BuildingType } | null;
 type Particle = { x: number; y: number; vx: number; vy: number; life: number; color: string };
@@ -54,26 +49,27 @@ type Particle = { x: number; y: number; vx: number; vy: number; life: number; co
 // ─── Constants ───────────────────────────────────────────────────────────────
 const DIFFICULTY_REGEN: Record<string, number> = { relaxed: 0.6, balanced: 1.0, intense: 1.5 };
 
-// Pressure simulation
-const BASE_SPREAD    = 0.022;  // base leak per tick (fraction of strength)
-const PUSH_BOOST     = 4.0;    // directional bias multiplier toward target
+// Pressure simulation — OpenFront style: slow organic border growth
+// Tiles spread one at a time from your border, directed toward your attack target
+const PASSIVE_SPREAD_CHANCE = 0.003;  // per-border-tile per tick, no target
+const ATTACK_SPREAD_CHANCE  = 0.018;  // per-border-tile per tick, toward target
 const FORT_DEFENSE   = 3.0;
 const DEFPOST_MULT   = 1.8;
-const NEUTRAL_RESIST = 0.35;
-const ENEMY_RESIST   = 1.0;
 const MAX_STRENGTH   = 100;
-const REGEN_RATE     = 0.25;   // strength regen per frame for owned tiles
+const REGEN_RATE     = 0.3;
 
-// Unit multipliers on spread pressure
+// Unit multipliers on spread chance
 const UNIT_MULT: Record<UnitType, number> = { infantry: 1.0, tank: 2.5, warship: 1.5 };
 const UNIT_COST: Record<UnitType, number> = { infantry: 0, tank: 80, warship: 60 };
 
-const FACTORY_UNITS = 8;
-const PORT_COINS    = 3;
-const CITY_COINS    = 2;
-const CITY_POP_CAP  = 500;
-const STARTER_RADIUS = 1;
-const SHIP_SPEED    = 0.0006;
+const FACTORY_UNITS  = 8;
+const PORT_COINS     = 3;
+const CITY_COINS     = 2;
+const CITY_POP_CAP   = 500;
+const STARTER_RADIUS = 2;   // tiny spawn — just a few cells
+
+// Ship speed: tiles per ms (we'll compute actual travel time from distance)
+const SHIP_TILES_PER_MS = 0.004; // ~250ms per tile — feels like it's crossing ocean
 
 const BUILD_COST: Record<BuildingType, [number, number]> = {
   city: [80, 0], defense_post: [30, 20], port: [60, 0], fort: [40, 40],
@@ -107,8 +103,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
 
   const [players,      setPlayers]      = useState<LobbyPlayer[]>([]);
   const [,             setTick]         = useState(0);
-  const [sendPct,      setSendPct]      = useState(40);
-  const [radialMenu,   setRadialMenu]   = useState<RadialMenu>(null);
+  const [sendPct,      setSendPct]      = useState(20);
   const [placeMode,    setPlaceMode]    = useState<PlaceMode>(null);
   const [bombMode,     setBombMode]     = useState<BombType | null>(null);
   const [buildings,    setBuildings]    = useState<Building[]>([]);
@@ -116,15 +111,16 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
   const [isDead,       setIsDead]       = useState(false);
   const [isSpectating, setIsSpectating] = useState(false);
   const [unitType,     setUnitType]     = useState<UnitType>("infantry");
+  const [attackTarget, setAttackTarget] = useState<{ name: string } | null>(null); // just for UI display
 
-  const sendPctRef   = useRef(40);
-  const buildingsRef = useRef<Building[]>([]);
-  const placeModeRef = useRef<PlaceMode>(null);
-  const bombModeRef  = useRef<BombType | null>(null);
-  const unitTypeRef  = useRef<UnitType>("infantry");
-  const keysRef      = useRef<Set<string>>(new Set());
+  const sendPctRef    = useRef(20);
+  const buildingsRef  = useRef<Building[]>([]);
+  const placeModeRef  = useRef<PlaceMode>(null);
+  const bombModeRef   = useRef<BombType | null>(null);
+  const unitTypeRef   = useRef<UnitType>("infantry");
+  const keysRef       = useRef<Set<string>>(new Set());
 
-  useEffect(() => { sendPctRef.current   = sendPct;   }, [sendPct]);
+  useEffect(() => { sendPctRef.current  = sendPct;  }, [sendPct]);
   useEffect(() => { buildingsRef.current = buildings; }, [buildings]);
   useEffect(() => { placeModeRef.current = placeMode; }, [placeMode]);
   useEffect(() => { bombModeRef.current  = bombMode;  }, [bombMode]);
@@ -137,8 +133,10 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
   const coastMaskRef    = useRef<Uint8Array | null>(null);
   const radZonesRef     = useRef<RadZone[]>([]);
   const shipsRef        = useRef<Ship[]>([]);
-  const activePushRef   = useRef<ActivePush | null>(null);
-  const botPushesRef    = useRef<Map<number, ActivePush>>(new Map());
+  // My attack target — persistent directional bias (not a draining budget)
+  const myTargetRef     = useRef<AttackTarget | null>(null);
+  // Bot targets
+  const botTargetsRef   = useRef<Map<number, AttackTarget>>(new Map());
   const playersRef      = useRef<Map<string, LobbyPlayer>>(new Map());
   const playerIndexRef  = useRef<Map<string, number>>(new Map());
   const colorsRef       = useRef<[number, number, number][]>([]);
@@ -227,9 +225,9 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
           setBuildings(prev => [...prev, b]);
         }
       })
-      .on("broadcast", { event: "push" }, ({ payload }) => {
-        const push = payload as ActivePush;
-        botPushesRef.current.set(push.ownerIdx, push);
+      .on("broadcast", { event: "target" }, ({ payload }) => {
+        const t = payload as AttackTarget;
+        botTargetsRef.current.set(t.ownerIdx, t);
       })
       .on("broadcast", { event: "rad_zone" }, ({ payload }) => {
         radZonesRef.current = [...radZonesRef.current, ...(payload as RadZone[])];
@@ -279,13 +277,16 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     const ro = new ResizeObserver(resize); ro.observe(container);
 
     // ── Pressure simulation tick ──────────────────────────────────────────
+    // OpenFront-style: each tick, each border cell has a chance to flip an adjacent
+    // non-owned cell. The attack target biases WHICH direction is chosen.
+    // "Attack ratio" controls how many troops are consumed per flip = how fast you spread.
     function tickPressure(dt: number) {
       const mask = landMaskRef.current; if (!mask) return;
       const grid = ownerGridRef.current;
       const str  = strengthGridRef.current;
       const blds = buildingsRef.current;
-      const myPush = activePushRef.current;
-      const bpush  = botPushesRef.current;
+      const myTarget  = myTargetRef.current;
+      const botTargets = botTargetsRef.current;
 
       // Regen: owned tiles fill toward MAX_STRENGTH
       const regenMult = DIFFICULTY_REGEN[lobby.difficulty] ?? 1;
@@ -294,114 +295,135 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         str[i] = Math.min(MAX_STRENGTH, str[i] + REGEN_RATE * regenMult * dt * 0.06);
       }
 
-      // Spread deltas
-      const deltaOwner = new Int16Array(grid.length).fill(-2);
-      const deltaStr   = new Float32Array(grid.length);
-
-      for (let i = 0; i < grid.length; i++) {
-        const o = grid[i]; if (o < 0 || str[i] < 0.5) continue;
-
-        // Get push for this owner
-        let push: ActivePush | null = null;
-        if (myPush && myPush.ownerIdx === o && myPush.strength > 0) push = myPush;
-        else if (bpush.has(o)) { const bp = bpush.get(o)!; if (bp.strength > 0) push = bp; }
-
-        const x = i % GRID_W, y = Math.floor(i / GRID_W);
-        const tx = push ? push.targetIdx % GRID_W : -1;
-        const ty = push ? Math.floor(push.targetIdx / GRID_W) : -1;
-
-        for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const) {
-          const nx = x + dx, ny = y + dy;
-          if (nx < 0 || ny < 0 || nx >= GRID_W || ny >= GRID_H) continue;
-          const ni = ny * GRID_W + nx;
-          if (!mask[ni]) continue;
-          const no = grid[ni]; if (no === o) continue;
-
-          // Directional bias
-          let bias = push ? 0.15 : 0.5; // passive spread without push is slow
-          if (push) {
-            const distNow  = Math.abs(x - tx) + Math.abs(y - ty);
-            const distNext = Math.abs(nx - tx) + Math.abs(ny - ty);
-            bias = distNext < distNow ? PUSH_BOOST : 0.15;
-          }
-
-          const hasFort    = blds.some(b => b.gridIdx === ni && b.type === "fort");
-          const hasDefPost = blds.some(b => b.gridIdx === ni && b.type === "defense_post");
-          const defMult    = hasFort ? FORT_DEFENSE : hasDefPost ? DEFPOST_MULT : 1.0;
-          const resist     = no < 0 ? NEUTRAL_RESIST : ENEMY_RESIST;
-          const uMult      = push ? UNIT_MULT[push.unitType] : 1.0;
-
-          const rate   = BASE_SPREAD * bias * uMult * dt * 0.06;
-          const attack = str[i] * rate;
-          const defend = (no < 0 ? 0 : str[ni]) * resist * defMult;
-          const net    = attack - defend;
-
-          if (net <= 0) continue;
-
-          if (no < 0) {
-            // Claim neutral tile
-            if (deltaOwner[ni] === -2) {
-              deltaOwner[ni] = o;
-              deltaStr[ni]   = Math.min(net * 3, MAX_STRENGTH * 0.6);
-            }
-          } else {
-            // Erode enemy
-            deltaStr[ni] += -net;
-            if (str[ni] + deltaStr[ni] <= 0) {
-              deltaOwner[ni] = o;
-              deltaStr[ni]   = Math.abs(str[ni] + deltaStr[ni]);
-            }
-          }
-        }
-      }
-
-      // Apply deltas
+      // Build border-tile lists per player (only tiles adjacent to non-owned land)
+      // We'll collect all owned border tiles then process them
       const claims: { i: number; o: number; s: number }[] = [];
       const mr  = mapRectRef.current;
       const cam = camRef.current;
 
-      for (let i = 0; i < grid.length; i++) {
-        if (deltaStr[i] !== 0) str[i] = Math.max(0, Math.min(MAX_STRENGTH, str[i] + deltaStr[i]));
-        if (deltaOwner[i] === -2) continue;
+      // Shuffle order each tick so no directional bias from array order
+      const indices = Array.from({ length: grid.length }, (_, i) => i);
+      // Fisher-Yates partial shuffle (just randomize which we visit first)
+      for (let k = indices.length - 1; k > 0; k--) {
+        const j = Math.floor(Math.random() * (k + 1));
+        [indices[k], indices[j]] = [indices[j], indices[k]];
+      }
 
-        const prevOwner = grid[i];
-        grid[i] = deltaOwner[i];
-        str[i]  = Math.max(0.1, deltaStr[i] > 0 ? deltaStr[i] : str[i]);
+      const flipped = new Set<number>();
 
-        // Particle at flipped cell
-        const wx = mr.x + ((i % GRID_W) + 0.5) / GRID_W * mr.w;
-        const wy = mr.y + (Math.floor(i / GRID_W) + 0.5) / GRID_H * mr.h;
-        const scx = cam.x + wx * cam.zoom, scy = cam.y + wy * cam.zoom;
-        const newOwner = deltaOwner[i];
-        const col = newOwner >= 0 && colorsRef.current[newOwner]
-          ? `rgb(${colorsRef.current[newOwner].join(",")})` : "#fff";
-        particlesRef.current.push({ x: scx, y: scy, vx: (Math.random() - 0.5) * 0.7, vy: (Math.random() - 0.5) * 0.7, life: 1, color: col });
+      for (const i of indices) {
+        const o = grid[i]; if (o < 0 || str[i] < 1) continue;
 
-        // Transfer building ownership
-        blds.forEach(b => { if (b.gridIdx === i && newOwner >= 0) b.ownerIdx = newOwner; });
+        // Get this player's target
+        let target: AttackTarget | null = null;
+        if (myTarget && myTarget.ownerIdx === o) target = myTarget;
+        else if (botTargets.has(o)) target = botTargets.get(o)!;
 
-        // Elimination check
-        if (prevOwner >= 0 && prevOwner !== newOwner && !eliminatedRef.current.has(prevOwner)) {
-          let survived = false;
-          for (let k = 0; k < grid.length; k++) if (grid[k] === prevOwner) { survived = true; break; }
-          if (!survived) {
-            eliminatedRef.current.add(prevOwner);
-            // Award coins to killer
-            const killerPid = [...playerIndexRef.current.entries()].find(([, v]) => v === newOwner)?.[0];
-            if (killerPid) {
-              const killer = playersRef.current.get(killerPid);
-              if (killer) {
-                killer.coins = (killer.coins || 0) + 500;
-                supabase.from("lobby_players").update({ coins: killer.coins }).eq("lobby_id", lobby.id).eq("player_id", killerPid);
-                if (killerPid === playerId) notify("Enemy eliminated! +500 coins", "success");
-              }
-            }
-            const myIdx = playerIndexRef.current.get(playerId);
-            if (prevOwner === myIdx) setIsDead(true);
+        const uMult = target ? UNIT_MULT[target.unitType] : 1.0;
+        const spreadChance = target ? ATTACK_SPREAD_CHANCE : PASSIVE_SPREAD_CHANCE;
+
+        const x = i % GRID_W, y = Math.floor(i / GRID_W);
+
+        // Collect candidate neighbors
+        const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]] as const;
+        let candidates: { ni: number; dx: number; dy: number }[] = [];
+
+        for (const [dx, dy] of dirs) {
+          const nx = x + dx, ny = y + dy;
+          if (nx < 0 || ny < 0 || nx >= GRID_W || ny >= GRID_H) continue;
+          const ni = ny * GRID_W + nx;
+          if (!mask[ni]) continue;
+          if (grid[ni] === o) continue;
+          if (flipped.has(ni)) continue;
+          candidates.push({ ni, dx, dy });
+        }
+        if (candidates.length === 0) continue;
+
+        // Bias candidates toward target if set
+        if (target) {
+          const tx = target.targetIdx % GRID_W, ty = Math.floor(target.targetIdx / GRID_W);
+          const myDist = Math.abs(x - tx) + Math.abs(y - ty);
+          // Weight: dirs that reduce distance get PUSH_BOOST weight
+          const weighted: { ni: number }[] = [];
+          for (const c of candidates) {
+            const ndist = Math.abs((x + c.dx) - tx) + Math.abs((y + c.dy) - ty);
+            const w = ndist < myDist ? 6 : 1; // 6x more likely to go toward target
+            for (let w2 = 0; w2 < w; w2++) weighted.push(c);
           }
+          candidates = weighted;
         }
 
-        claims.push({ i, o: grid[i], s: str[i] });
+        // Roll spread chance (scaled by dt and unit multiplier)
+        const roll = Math.random();
+        if (roll > spreadChance * uMult * (dt / 16.67)) continue;
+
+        // Pick random candidate (already weighted toward target)
+        const chosen = candidates[Math.floor(Math.random() * candidates.length)];
+        const ni = chosen.ni;
+        const no = grid[ni];
+
+        const hasFort    = blds.some(b => b.gridIdx === ni && b.type === "fort");
+        const hasDefPost = blds.some(b => b.gridIdx === ni && b.type === "defense_post");
+        const defMult    = hasFort ? FORT_DEFENSE : hasDefPost ? DEFPOST_MULT : 1.0;
+
+        if (no < 0) {
+          // Claim neutral tile — always succeeds
+          grid[ni] = o;
+          str[ni]  = Math.max(1, str[i] * 0.4);
+          flipped.add(ni);
+          claims.push({ i: ni, o, s: str[ni] });
+
+          // Particle
+          const wx2 = mr.x + ((ni % GRID_W) + 0.5) / GRID_W * mr.w;
+          const wy2 = mr.y + (Math.floor(ni / GRID_W) + 0.5) / GRID_H * mr.h;
+          const col2 = colorsRef.current[o] ? `rgb(${colorsRef.current[o].join(",")})` : "#fff";
+          particlesRef.current.push({ x: cam.x + wx2 * cam.zoom, y: cam.y + wy2 * cam.zoom, vx: (Math.random() - 0.5) * 0.5, vy: (Math.random() - 0.5) * 0.5, life: 0.8, color: col2 });
+        } else {
+          // Contest enemy tile — compare strengths
+          const attackPow = str[i] * 0.15 * uMult;
+          const defendPow = str[ni] * 0.15 * defMult;
+          if (attackPow > defendPow || Math.random() < 0.05) {
+            // Win: flip tile
+            grid[ni] = o;
+            str[ni]  = Math.max(1, attackPow - defendPow);
+            flipped.add(ni);
+            claims.push({ i: ni, o, s: str[ni] });
+
+            const wx2 = mr.x + ((ni % GRID_W) + 0.5) / GRID_W * mr.w;
+            const wy2 = mr.y + (Math.floor(ni / GRID_W) + 0.5) / GRID_H * mr.h;
+            const col2 = colorsRef.current[o] ? `rgb(${colorsRef.current[o].join(",")})` : "#fff";
+            for (let pi = 0; pi < 3; pi++) {
+              particlesRef.current.push({ x: cam.x + wx2 * cam.zoom, y: cam.y + wy2 * cam.zoom, vx: (Math.random() - 0.5) * 1.2, vy: (Math.random() - 0.5) * 1.2, life: 1, color: col2 });
+            }
+
+            // Check elimination
+            const prevOwner = no;
+            if (!eliminatedRef.current.has(prevOwner)) {
+              let survived = false;
+              for (let k = 0; k < grid.length; k++) if (grid[k] === prevOwner) { survived = true; break; }
+              if (!survived) {
+                eliminatedRef.current.add(prevOwner);
+                const killerPid = [...playerIndexRef.current.entries()].find(([, v]) => v === o)?.[0];
+                if (killerPid) {
+                  const killer = playersRef.current.get(killerPid);
+                  if (killer) {
+                    killer.coins = (killer.coins || 0) + 500;
+                    supabase.from("lobby_players").update({ coins: killer.coins }).eq("lobby_id", lobby.id).eq("player_id", killerPid);
+                    if (killerPid === playerId) notify("Enemy eliminated! +500 coins", "success");
+                  }
+                }
+                const myIdx = playerIndexRef.current.get(playerId);
+                if (prevOwner === myIdx) setIsDead(true);
+              }
+            }
+
+            // Transfer building
+            blds.forEach(b => { if (b.gridIdx === ni && o >= 0) b.ownerIdx = o; });
+          } else {
+            // Lose: attacker tile weakens slightly
+            str[i] = Math.max(0, str[i] - defendPow * 0.05);
+          }
+        }
       }
 
       if (claims.length > 0) {
@@ -409,10 +431,6 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
           channelRef.current?.send({ type: "broadcast", event: "claim", payload: claims.slice(ci, ci + 60) });
         }
       }
-
-      // Drain push budget
-      if (myPush) { myPush.strength = Math.max(0, myPush.strength - claims.filter(c => c.o === myPush.ownerIdx).length * 1.5); if (myPush.strength <= 0) activePushRef.current = null; }
-      bpush.forEach((bp, idx) => { bp.strength = Math.max(0, bp.strength - claims.filter(c => c.o === idx).length * 1.5); if (bp.strength <= 0) bpush.delete(idx); });
     }
 
     // ── Sync to DB ────────────────────────────────────────────────────────
@@ -438,10 +456,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
       playersRef.current.forEach(p => {
         const idx = playerIndexRef.current.get(p.player_id); if (idx === undefined) return;
         const px = pixelCounts[idx] ?? 0;
-        if (!p.alive && p.is_bot) { // dead bots stay dead
-          if (!eliminatedRef.current.has(idx)) eliminatedRef.current.add(idx);
-          return;
-        }
+        if (!p.alive && p.is_bot) { if (!eliminatedRef.current.has(idx)) eliminatedRef.current.add(idx); return; }
         const passive  = Math.round(Math.sqrt(px) * 2 * regenMult);
         const newUnits = Math.min(9999 + (popCapBonus[idx] || 0), p.units + passive + (unitBonus[idx] || 0));
         const newCoins = Math.min(99999, (p.coins || 0) + (coinBonus[idx] || 0));
@@ -547,14 +562,21 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         ctx.strokeRect(mx + x * cellW + 0.5, my + y * cellH + 0.5, cellW - 1, cellH - 1);
       }
 
-      // Push target ring
-      const push = activePushRef.current;
-      if (push) {
-        const ptx = mx + (push.targetIdx % GRID_W + 0.5) * cellW;
-        const pty = my + (Math.floor(push.targetIdx / GRID_W) + 0.5) * cellH;
-        ctx.save(); ctx.strokeStyle = "rgba(255,255,100,0.8)"; ctx.lineWidth = 1.5;
-        ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.arc(ptx, pty, cellW * 2, 0, Math.PI * 2); ctx.stroke();
-        ctx.setLineDash([]); ctx.restore();
+      // Attack target indicator — small pulsing dot on target, NO big circle
+      const myTarget = myTargetRef.current;
+      if (myTarget) {
+        const ptx = mx + (myTarget.targetIdx % GRID_W + 0.5) * cellW;
+        const pty = my + (Math.floor(myTarget.targetIdx / GRID_W) + 0.5) * cellH;
+        const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 200);
+        ctx.save();
+        // Small cross-hair style target marker
+        ctx.strokeStyle = `rgba(255,255,100,${0.6 + pulse * 0.4})`;
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(ptx - cellW * 2, pty); ctx.lineTo(ptx + cellW * 2, pty);
+        ctx.moveTo(ptx, pty - cellH * 2); ctx.lineTo(ptx, pty + cellH * 2);
+        ctx.stroke();
+        ctx.restore();
       }
 
       // Buildings
@@ -565,22 +587,28 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         drawBldIcon(mx + (b.gridIdx % GRID_W) / GRID_W * mw + cellW / 2, my + Math.floor(b.gridIdx / GRID_W) / GRID_H * mh + cellH / 2, b.type, col, cam.zoom);
       });
 
-      // Ships
+      // Ships — draw as a boat icon traveling across ocean
       shipsRef.current.forEach(ship => {
         const sx = ship.fromX + (ship.toX - ship.fromX) * ship.progress;
         const sy = ship.fromY + (ship.toY - ship.fromY) * ship.progress;
         const entry = [...playerIndexRef.current.entries()].find(([, v]) => v === ship.ownerIdx);
         const col = entry ? playersRef.current.get(entry[0])?.color ?? "#4af" : "#4af";
+        const angle = Math.atan2(ship.toY - ship.fromY, ship.toX - ship.fromX);
         ctx.save();
-        ctx.translate(sx, sy); ctx.rotate(Math.atan2(ship.toY - ship.fromY, ship.toX - ship.fromX));
+        ctx.translate(sx, sy); ctx.rotate(angle);
+        // Hull
         ctx.fillStyle = col; ctx.strokeStyle = "rgba(255,255,255,0.8)"; ctx.lineWidth = 0.8;
-        ctx.beginPath(); ctx.ellipse(0, 0, 6, 3, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
-        ctx.globalAlpha = 0.3; ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5;
-        ctx.beginPath(); ctx.moveTo(-8, 1.5); ctx.lineTo(-16, 3); ctx.moveTo(-8, -1.5); ctx.lineTo(-16, -3); ctx.stroke();
+        ctx.beginPath(); ctx.ellipse(0, 0, 7, 3.5, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+        // Wake lines behind
+        ctx.globalAlpha = 0.25; ctx.strokeStyle = "#aef"; ctx.lineWidth = 1.2;
+        ctx.beginPath(); ctx.moveTo(-9, 2); ctx.lineTo(-18, 4); ctx.moveTo(-9, -2); ctx.lineTo(-18, -4); ctx.stroke();
         ctx.restore();
-        ctx.save(); ctx.fillStyle = "#fff"; ctx.font = `bold ${Math.max(6, 8 * cam.zoom)}px monospace`;
-        ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.shadowColor = "rgba(0,0,0,0.9)"; ctx.shadowBlur = 3;
-        ctx.fillText(`${ship.units}`, sx, sy - 10); ctx.restore();
+        // Troop count above ship
+        ctx.save();
+        ctx.fillStyle = "#fff"; ctx.font = `bold ${Math.max(7, 9 * cam.zoom)}px monospace`;
+        ctx.textAlign = "center"; ctx.textBaseline = "middle";
+        ctx.shadowColor = "rgba(0,0,0,0.9)"; ctx.shadowBlur = 3;
+        ctx.fillText(`${ship.units}`, sx, sy - 11); ctx.restore();
       });
 
       // Nameplates
@@ -611,22 +639,17 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
       }
       ctx.globalAlpha = 1;
 
-      // Mode hint
+      // Mode hint — top center
       if (placeModeRef.current || bombModeRef.current) {
-        ctx.save(); ctx.font = `${14 * devicePixelRatio}px sans-serif`; ctx.fillStyle = "rgba(255,255,100,0.9)"; ctx.textAlign = "center";
-        ctx.fillText(placeModeRef.current ? `Click to place ${BUILDING_LABELS[placeModeRef.current.type]}` : `Click to drop ${bombModeRef.current} bomb · Right-click cancel`, canvas!.width / 2, 28 * devicePixelRatio);
+        ctx.save(); ctx.font = `${14 * devicePixelRatio}px sans-serif`;
+        ctx.fillStyle = "rgba(255,255,100,0.9)"; ctx.textAlign = "center";
+        ctx.fillText(
+          placeModeRef.current
+            ? `Click to place ${BUILDING_LABELS[placeModeRef.current.type]}  ·  Right-click to cancel`
+            : `Click to drop ${bombModeRef.current} bomb  ·  Right-click to cancel`,
+          canvas!.width / 2, 28 * devicePixelRatio
+        );
         ctx.restore();
-      }
-
-      // Push strength bar
-      if (push && push.strength > 0) {
-        const me2 = playersRef.current.get(playerId);
-        const maxStr = me2 ? Math.floor(me2.units * sendPctRef.current / 100) : 100;
-        const barW = 200 * devicePixelRatio, barH = 8 * devicePixelRatio;
-        const bx = (canvas!.width - barW) / 2, by = canvas!.height - 52 * devicePixelRatio;
-        ctx.fillStyle = "rgba(0,0,0,0.5)"; ctx.fillRect(bx, by, barW, barH);
-        ctx.fillStyle = "#facc15"; ctx.fillRect(bx, by, barW * (push.strength / Math.max(1, maxStr)), barH);
-        ctx.strokeStyle = "rgba(255,255,255,0.3)"; ctx.lineWidth = 1; ctx.strokeRect(bx, by, barW, barH);
       }
     }
 
@@ -643,20 +666,29 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
 
       tickPressure(dt);
 
-      // Ships
+      // Ships — move at speed proportional to actual tile distance
       const navalBoost = new Set(buildingsRef.current.filter(b => b.type === "naval_base").map(b => b.ownerIdx));
       shipsRef.current = shipsRef.current.filter(ship => {
-        ship.progress = Math.min(1, ship.progress + SHIP_SPEED * (navalBoost.has(ship.ownerIdx) ? 2 : 1) * dt);
+        const speed = SHIP_TILES_PER_MS / Math.max(1, ship.distanceTiles) * (navalBoost.has(ship.ownerIdx) ? 1.7 : 1);
+        ship.progress = Math.min(1, ship.progress + speed * dt);
         if (ship.progress >= 1) {
-          // Land troops: seed owned tiles at landing zone
-          const mask = landMaskRef.current; if (mask) {
+          // Land troops ONLY on coastline tiles near target
+          const mask2 = landMaskRef.current; const coast2 = coastMaskRef.current;
+          if (mask2 && coast2) {
             const gr = ownerGridRef.current, st = strengthGridRef.current;
             const ltx = ship.targetGridIdx % GRID_W, lty = Math.floor(ship.targetGridIdx / GRID_W);
-            for (let dy = -3; dy <= 3; dy++) for (let dx = -3; dx <= 3; dx++) {
+            // Seed only coastal tiles in landing radius
+            for (let dy = -4; dy <= 4; dy++) for (let dx = -4; dx <= 4; dx++) {
+              if (Math.abs(dx) + Math.abs(dy) > 4) continue;
               const nx = ltx + dx, ny = lty + dy;
               if (nx < 0 || ny < 0 || nx >= GRID_W || ny >= GRID_H) continue;
-              const ni = ny * GRID_W + nx; if (!mask[ni]) continue;
-              if (gr[ni] !== ship.ownerIdx) { gr[ni] = ship.ownerIdx; st[ni] = Math.min(MAX_STRENGTH, ship.units * 0.4); }
+              const ni = ny * GRID_W + nx;
+              // Only land on coastal or land tiles (not deep ocean), don't overwrite own tiles
+              if (!mask2[ni]) continue;
+              if (gr[ni] !== ship.ownerIdx) {
+                gr[ni] = ship.ownerIdx;
+                st[ni] = Math.min(MAX_STRENGTH, Math.max(5, ship.units * 0.15));
+              }
             }
           }
           return false;
@@ -678,7 +710,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
       // Bot AI
       if (lobby.host_id === playerId && now - lastBotRef.current > 2200) {
         lastBotRef.current = now;
-        const mask = landMaskRef.current; if (mask) {
+        const mask2 = landMaskRef.current; if (mask2) {
           const gr = ownerGridRef.current;
           playersRef.current.forEach(bot => {
             if (!bot.is_bot || !bot.alive) return;
@@ -688,7 +720,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
             for (let i = 0; i < gr.length; i++) if (gr[i] === idx) owned.push(i);
             if (owned.length === 0) {
               const cands: number[] = [];
-              for (let i = 0; i < mask.length; i++) if (mask[i] && gr[i] === -1) cands.push(i);
+              for (let i = 0; i < mask2.length; i++) if (mask2[i] && gr[i] === -1) cands.push(i);
               if (cands.length === 0) return;
               plantStarter(cands[Math.floor(Math.random() * cands.length)], idx); return;
             }
@@ -711,11 +743,11 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
             if (bot.units < 20) return;
             const neutral: number[] = [], enemy: number[] = [];
             for (const i of owned) {
-              const x = i % GRID_W, y = Math.floor(i / GRID_W);
+              const x2 = i % GRID_W, y2 = Math.floor(i / GRID_W);
               for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const) {
-                const nx = x + dx, ny = y + dy;
+                const nx = x2 + dx, ny = y2 + dy;
                 if (nx < 0 || ny < 0 || nx >= GRID_W || ny >= GRID_H) continue;
-                const ni = ny * GRID_W + nx; if (!mask[ni]) continue;
+                const ni = ny * GRID_W + nx; if (!mask2[ni]) continue;
                 if (gr[ni] === -1) neutral.push(ni); else if (gr[ni] !== idx) enemy.push(ni);
               }
             }
@@ -723,9 +755,9 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
             if (neutral.length > 0 && bot.units > 30) target = neutral[Math.floor(Math.random() * neutral.length)];
             else if (enemy.length > 0 && bot.units > 100) target = enemy[Math.floor(Math.random() * enemy.length)];
             if (target === -1) return;
-            const bp: ActivePush = { ownerIdx: idx, targetIdx: target, strength: Math.floor(bot.units * 0.4), unitType: "infantry" };
-            botPushesRef.current.set(idx, bp);
-            channelRef.current?.send({ type: "broadcast", event: "push", payload: bp });
+            const bt: AttackTarget = { ownerIdx: idx, targetIdx: target, unitType: "infantry" };
+            botTargetsRef.current.set(idx, bt);
+            channelRef.current?.send({ type: "broadcast", event: "target", payload: bt });
           });
         }
       }
@@ -760,7 +792,9 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     function onMouseUp() { dragRef.current.active = false; }
     function onKeyDown(e: KeyboardEvent) {
       keysRef.current.add(e.key.toLowerCase());
+      // Shortcuts
       if (e.key === "c" || e.key === "C") {
+        // Center on own territory
         const myIdx = playerIndexRef.current.get(playerId); if (myIdx === undefined) return;
         const gr = ownerGridRef.current; let sx = 0, sy = 0, cnt = 0;
         for (let i = 0; i < gr.length; i++) if (gr[i] === myIdx) { sx += i % GRID_W; sy += Math.floor(i / GRID_W); cnt++; }
@@ -770,6 +804,30 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         camRef.current.x = canvas!.width / 2 - wx * camRef.current.zoom;
         camRef.current.y = canvas!.height / 2 - wy * camRef.current.zoom;
       }
+      if (e.key === "Escape") {
+        setPlaceMode(null); placeModeRef.current = null;
+        setBombMode(null); bombModeRef.current = null;
+        myTargetRef.current = null;
+        setAttackTarget(null);
+      }
+      // Number keys 1-8 for buildings
+      const num = parseInt(e.key);
+      if (num >= 1 && num <= 8) {
+        const toolbar: BuildingType[] = ["city", "factory", "port", "naval_base", "defense_post", "fort", "missile_silo", "sam_launcher"];
+        const btype = toolbar[num - 1];
+        if (btype) {
+          if (placeModeRef.current?.type === btype) {
+            setPlaceMode(null); placeModeRef.current = null;
+          } else {
+            setPlaceMode({ type: btype }); placeModeRef.current = { type: btype };
+            setBombMode(null); bombModeRef.current = null;
+          }
+        }
+      }
+      // Q/E for unit type
+      if (e.key === "q" || e.key === "Q") { setUnitType("infantry"); unitTypeRef.current = "infantry"; }
+      if (e.key === "e" || e.key === "E") { setUnitType("tank"); unitTypeRef.current = "tank"; }
+      if (e.key === "r" || e.key === "R") { setUnitType("warship"); unitTypeRef.current = "warship"; }
     }
     function onKeyUp(e: KeyboardEvent) { keysRef.current.delete(e.key.toLowerCase()); }
 
@@ -806,19 +864,25 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     if (claims.length > 0) channelRef.current?.send({ type: "broadcast", event: "claim", payload: claims });
   }
 
-  // ── Launch push ───────────────────────────────────────────────────────────
-  function launchPush(targetIdx: number, ownerIdx: number, ownerPid: string) {
-    const me = playersRef.current.get(ownerPid); if (!me) return;
-    const strength = Math.max(1, Math.floor(me.units * sendPctRef.current / 100));
-    const push: ActivePush = { ownerIdx, targetIdx, strength, unitType: unitTypeRef.current };
-    activePushRef.current = push;
-    channelRef.current?.send({ type: "broadcast", event: "push", payload: push });
+  // ── Set attack target ─────────────────────────────────────────────────────
+  function setMyTarget(targetIdx: number, ownerIdx: number, targetName?: string) {
+    const myIdx = playerIndexRef.current.get(playerId);
+    if (myIdx === undefined) return;
+    const target: AttackTarget = { ownerIdx, targetIdx, unitType: unitTypeRef.current };
+    myTargetRef.current = target;
+    channelRef.current?.send({ type: "broadcast", event: "target", payload: target });
+    setAttackTarget(targetName ? { name: targetName } : null);
   }
 
-  // ── Naval attack ──────────────────────────────────────────────────────────
+  // ── Naval attack — only valid target is enemy/neutral COASTLINE ───────────
   function launchShip(targetIdx: number, ownerIdx: number, ownerPid: string) {
     const coast = coastMaskRef.current; if (!coast) return;
+    // Target must be a coast or land tile — ships attack coastlines
+    const mask = landMaskRef.current;
+    if (!mask || !mask[targetIdx]) { notify("Ships can only attack land tiles", "error"); return; }
+
     const grid = ownerGridRef.current;
+    // Find nearest OWN coastal tile as departure point
     let bestFrom = -1, bestDist = Infinity;
     for (let i = 0; i < grid.length; i++) {
       if (grid[i] !== ownerIdx || !coast[i]) continue;
@@ -826,20 +890,41 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
       if (d < bestDist) { bestDist = d; bestFrom = i; }
     }
     if (bestFrom === -1) { notify("Need a coastal tile to launch ships", "error"); return; }
+
+    // Find nearest ENEMY/NEUTRAL coastal tile to the target as actual landing point
+    let landingIdx = targetIdx;
+    if (coast[targetIdx]) {
+      landingIdx = targetIdx; // already coastal, good
+    } else {
+      // Find nearest coastal tile to the clicked land tile
+      let nearestCoast = -1, nearestDist = Infinity;
+      const tx = targetIdx % GRID_W, ty = Math.floor(targetIdx / GRID_W);
+      for (let i = 0; i < coast.length; i++) {
+        if (!coast[i] || grid[i] === ownerIdx) continue;
+        const d = Math.abs(i % GRID_W - tx) + Math.abs(Math.floor(i / GRID_W) - ty);
+        if (d < nearestDist) { nearestDist = d; nearestCoast = i; }
+      }
+      if (nearestCoast !== -1 && nearestDist < 30) landingIdx = nearestCoast;
+    }
+
     const mr = mapRectRef.current, cW = mr.w / GRID_W, cH = mr.h / GRID_H;
     const me = playersRef.current.get(ownerPid); if (!me) return;
     const sendUnits = Math.max(1, Math.floor(me.units * sendPctRef.current / 100));
+    const dist = Math.abs(bestFrom % GRID_W - landingIdx % GRID_W) + Math.abs(Math.floor(bestFrom / GRID_W) - Math.floor(landingIdx / GRID_W));
+
     const ship: Ship = {
       id: crypto.randomUUID(), ownerIdx,
       fromX: mr.x + (bestFrom % GRID_W + 0.5) * cW, fromY: mr.y + (Math.floor(bestFrom / GRID_W) + 0.5) * cH,
-      toX: mr.x + (targetIdx % GRID_W + 0.5) * cW, toY: mr.y + (Math.floor(targetIdx / GRID_W) + 0.5) * cH,
-      units: sendUnits, targetGridIdx: targetIdx, progress: 0,
+      toX:   mr.x + (landingIdx % GRID_W + 0.5) * cW, toY: mr.y + (Math.floor(landingIdx / GRID_W) + 0.5) * cH,
+      units: sendUnits, targetGridIdx: landingIdx, progress: 0,
+      distanceTiles: Math.max(1, dist),
     };
     shipsRef.current = [...shipsRef.current, ship];
     channelRef.current?.send({ type: "broadcast", event: "ship", payload: ship });
     me.units = Math.max(0, me.units - sendUnits);
     supabase.from("lobby_players").update({ units: me.units }).eq("lobby_id", lobby.id).eq("player_id", ownerPid);
-    notify(`Fleet of ${sendUnits} launched!`, "success");
+    const etaSec = Math.round(dist / (SHIP_TILES_PER_MS * 1000));
+    notify(`Fleet of ${sendUnits} launched — ETA ~${etaSec}s`, "success");
   }
 
   // ── Drop bomb ─────────────────────────────────────────────────────────────
@@ -850,7 +935,6 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     const myIdx = playerIndexRef.current.get(ownerPid);
     const grid = ownerGridRef.current, str = strengthGridRef.current;
     const tx = targetIdx % GRID_W, ty = Math.floor(targetIdx / GRID_W), radius = BOMB_RADIUS[btype];
-    // SAM interception
     let intercepted = false;
     buildingsRef.current.forEach(b => {
       if (b.type !== "sam_launcher") return;
@@ -863,13 +947,12 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     supabase.from("lobby_players").update({ coins: me.coins }).eq("lobby_id", lobby.id).eq("player_id", ownerPid);
     const mask = landMaskRef.current; if (!mask) return;
     const affected: number[] = [];
-    for (let dy = -radius; dy <= radius; dy++) for (let dx = -radius; dx <= radius; dx++) {
-      if (Math.abs(dx) + Math.abs(dy) > radius) continue;
-      const nx = tx + dx, ny = ty + dy;
+    for (let dy2 = -radius; dy2 <= radius; dy2++) for (let dx2 = -radius; dx2 <= radius; dx2++) {
+      if (Math.abs(dx2) + Math.abs(dy2) > radius) continue;
+      const nx = tx + dx2, ny = ty + dy2;
       if (nx < 0 || ny < 0 || nx >= GRID_W || ny >= GRID_H || !mask[ny * GRID_W + nx]) continue;
       affected.push(ny * GRID_W + nx);
     }
-    // Destroy buildings in blast
     const destroyed = buildingsRef.current.filter(b => affected.includes(b.gridIdx));
     buildingsRef.current = buildingsRef.current.filter(b => !affected.includes(b.gridIdx));
     setBuildings(prev => prev.filter(b => !affected.includes(b.gridIdx)));
@@ -880,7 +963,6 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     const newZones: RadZone[] = affected.map(i => ({ gridIdx: i, strength: radStr, decay: btype === "dirty" ? 0.05 : 0.3 }));
     radZonesRef.current = [...radZonesRef.current, ...newZones];
     channelRef.current?.send({ type: "broadcast", event: "rad_zone", payload: newZones });
-    // Explosion particles
     const mr = mapRectRef.current, cam = camRef.current;
     const scx = cam.x + (mr.x + (tx + 0.5) / GRID_W * mr.w) * cam.zoom;
     const scy = cam.y + (mr.y + (ty + 0.5) / GRID_H * mr.h) * cam.zoom;
@@ -922,10 +1004,9 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     notify(`${BUILDING_LABELS[type]} built!`, "success");
   }
 
-  // ── Click ─────────────────────────────────────────────────────────────────
+  // ── Click handler ─────────────────────────────────────────────────────────
   function handleClick(e: React.MouseEvent) {
     if (dragMovedRef.current) { dragMovedRef.current = false; return; }
-    if (radialMenu) { setRadialMenu(null); return; }
     const coords = screenToGrid(e.clientX, e.clientY); if (!coords) return;
     const { gx, gy } = coords;
     const me = playersRef.current.get(playerId); if (!me) return;
@@ -933,30 +1014,46 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     const i = gy * GRID_W + gx;
     const mask = landMaskRef.current; if (!mask) return;
 
-    if (bombModeRef.current) { dropBomb(i, bombModeRef.current, playerId); setBombMode(null); bombModeRef.current = null; return; }
-    if (placeModeRef.current) { if (!mask[i]) { notify("Click on land", "error"); return; } doPlaceBuilding(gx, gy, placeModeRef.current.type); return; }
+    // Bomb mode
+    if (bombModeRef.current) {
+      dropBomb(i, bombModeRef.current, playerId);
+      setBombMode(null); bombModeRef.current = null; return;
+    }
+    // Place mode
+    if (placeModeRef.current) {
+      if (!mask[i]) { notify("Click on land", "error"); return; }
+      doPlaceBuilding(gx, gy, placeModeRef.current.type); return;
+    }
 
+    // No territory yet — spawn
     const grid = ownerGridRef.current;
     let hasTerritory = false;
     for (let k = 0; k < grid.length; k++) if (grid[k] === myIdx) { hasTerritory = true; break; }
     if (!hasTerritory) {
       if (!mask[i]) { notify("Click on land to start", "error"); return; }
       if (grid[i] !== -1) { notify("Pick an unclaimed tile", "error"); return; }
-      plantStarter(i, myIdx); setHasSpawned(true); notify("Empire founded! Click to push pressure.", "success"); return;
+      plantStarter(i, myIdx); setHasSpawned(true);
+      notify("Empire founded! Click enemy territory to attack.", "success"); return;
+    }
+
+    // Click on own territory — cancel attack target
+    if (grid[i] === myIdx) {
+      myTargetRef.current = null;
+      setAttackTarget(null);
+      notify("Attack cancelled", "info"); return;
     }
 
     if (!mask[i]) { notify("Click on land", "error"); return; }
-    if (grid[i] === myIdx) { notify("Already yours", "error"); return; }
 
-    // Reachability check
+    // Check if target is reachable by land
     let reachable = false;
     {
       const reach = new Uint8Array(grid.length); const q: number[] = [];
       for (let k = 0; k < grid.length; k++) {
         if (grid[k] !== myIdx) continue;
-        const x = k % GRID_W, y = Math.floor(k / GRID_W);
+        const x2 = k % GRID_W, y2 = Math.floor(k / GRID_W);
         for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const) {
-          const nx = x + dx, ny = y + dy;
+          const nx = x2 + dx, ny = y2 + dy;
           if (nx < 0 || ny < 0 || nx >= GRID_W || ny >= GRID_H) continue;
           const ni = ny * GRID_W + nx;
           if (!reach[ni] && mask[ni] && grid[ni] !== myIdx) { reach[ni] = 1; q.push(ni); }
@@ -965,9 +1062,9 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
       let h = 0;
       while (h < q.length) {
         const cur = q[h++]; if (cur === i) { reachable = true; break; }
-        const x = cur % GRID_W, y = Math.floor(cur / GRID_W);
+        const x2 = cur % GRID_W, y2 = Math.floor(cur / GRID_W);
         for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const) {
-          const nx = x + dx, ny = y + dy;
+          const nx = x2 + dx, ny = y2 + dy;
           if (nx < 0 || ny < 0 || nx >= GRID_W || ny >= GRID_H) continue;
           const ni = ny * GRID_W + nx;
           if (!reach[ni] && mask[ni]) { reach[ni] = 1; q.push(ni); }
@@ -975,39 +1072,45 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
       }
     }
 
-    if (!reachable) {
+    if (reachable) {
+      // Set land attack target
+      const targetOwnerIdx = grid[i];
+      let targetName: string | undefined;
+      if (targetOwnerIdx >= 0) {
+        const entry = [...playerIndexRef.current.entries()].find(([, v]) => v === targetOwnerIdx);
+        if (entry) targetName = playersRef.current.get(entry[0])?.name;
+      }
+      setMyTarget(i, myIdx, targetName);
+      if (targetName) notify(`Attacking ${targetName}!`, "info");
+    } else {
+      // Not reachable by land — try naval
       const hasPort = buildingsRef.current.some(b => b.ownerIdx === myIdx && b.type === "port");
-      if (hasPort) launchShip(i, myIdx, playerId);
-      else notify("No land path — build a Port for naval attacks", "error");
-      return;
+      if (hasPort) {
+        launchShip(i, myIdx, playerId);
+      } else {
+        notify("No land path — build a Port for naval attacks", "error");
+      }
     }
-
-    launchPush(i, myIdx, playerId);
   }
 
+  // ── Right click — cancel current action or open context for building ──────
   function handleContextMenu(e: React.MouseEvent) {
     e.preventDefault();
-    if (placeModeRef.current || bombModeRef.current) { setPlaceMode(null); setBombMode(null); placeModeRef.current = null; bombModeRef.current = null; return; }
-    const coords = screenToGrid(e.clientX, e.clientY); if (!coords) return;
-    const { gx, gy } = coords;
-    const myIdx = playerIndexRef.current.get(playerId);
-    const i = gy * GRID_W + gx;
-    const grid = ownerGridRef.current, mask = landMaskRef.current, coast = coastMaskRef.current;
-    setRadialMenu({
-      screenX: e.clientX, screenY: e.clientY, gx, gy,
-      isOwnTerritory: myIdx !== undefined && grid[i] === myIdx,
-      isLand: mask ? !!mask[i] : false, isCoast: coast ? !!coast[i] : false,
-      isEnemy: myIdx !== undefined && grid[i] >= 0 && grid[i] !== myIdx,
-      hasBuilding: buildingsRef.current.some(b => b.gridIdx === i),
-    });
+    if (placeModeRef.current || bombModeRef.current) {
+      setPlaceMode(null); setBombMode(null);
+      placeModeRef.current = null; bombModeRef.current = null; return;
+    }
+    // Cancel attack target
+    if (myTargetRef.current) {
+      myTargetRef.current = null;
+      setAttackTarget(null); return;
+    }
   }
 
   // ── Derived state ─────────────────────────────────────────────────────────
   const sortedPlayers = [...players].sort((a, b) => b.pixels - a.pixels);
   const me = playersRef.current.get(playerId);
   const myIdx = playerIndexRef.current.get(playerId);
-  const myCubeCount = me ? me.pixels : 0;
-  const sendingUnits = me ? Math.max(1, Math.floor(me.units * sendPct / 100)) : 0;
   const hasSilo = myIdx !== undefined && buildingsRef.current.some(b => b.ownerIdx === myIdx && b.type === "missile_silo");
   const TOOLBAR: BuildingType[] = ["city", "factory", "port", "naval_base", "defense_post", "fort", "missile_silo", "sam_launcher"];
 
@@ -1019,7 +1122,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
           <div className="text-6xl">💀</div>
           <div>
             <div className="text-2xl font-bold text-red-400 mb-1">Eliminated</div>
-            <div className="text-sm text-muted-foreground">Your empire has fallen. Watch the remaining players battle it out or leave.</div>
+            <div className="text-sm text-muted-foreground">Your empire has fallen. Watch the remaining players or leave.</div>
           </div>
           <div className="flex gap-3">
             <Button variant="outline" onClick={() => setIsSpectating(true)} className="gap-2">👁 Spectate</Button>
@@ -1057,10 +1160,18 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         </div>
       )}
 
-      {me && myCubeCount === 0 && !hasSpawned && !isDead && (
+      {/* Spawn prompt */}
+      {me && !hasSpawned && !isDead && (
         <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 rounded-xl border border-primary/60 bg-card/95 px-6 py-4 text-center shadow-2xl backdrop-blur-md pointer-events-none">
           <div className="text-lg font-bold mb-1">Pick your starting tile</div>
-          <div className="text-sm text-muted-foreground">Click any land tile to found your empire</div>
+          <div className="text-sm text-muted-foreground">Click any unclaimed land tile to found your empire</div>
+        </div>
+      )}
+
+      {/* Attack target indicator */}
+      {attackTarget && (
+        <div className="absolute top-14 left-1/2 -translate-x-1/2 z-10 flex items-center gap-2 rounded-lg border border-yellow-500/60 bg-card/90 px-3 py-1.5 text-xs font-bold text-yellow-300 backdrop-blur-md shadow">
+          ⚔️ Attacking {attackTarget.name ?? "territory"} — Right-click or click own land to cancel
         </div>
       )}
 
@@ -1077,7 +1188,11 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         ))}
       </div>
 
-      {!isSpectating && <Button onClick={onLeave} variant="secondary" size="sm" className="absolute right-3 top-3 gap-1.5 bg-card/85 backdrop-blur-md z-10"><LogOut className="h-3.5 w-3.5" />Leave</Button>}
+      {!isSpectating && (
+        <Button onClick={onLeave} variant="secondary" size="sm" className="absolute right-3 top-3 gap-1.5 bg-card/85 backdrop-blur-md z-10">
+          <LogOut className="h-3.5 w-3.5" />Leave
+        </Button>
+      )}
 
       {/* Bottom HUD */}
       {!isSpectating && (
@@ -1090,13 +1205,17 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
               const canAfford = me && (me.coins || 0) >= cc && me.units >= cu;
               const isActive = placeMode?.type === btype;
               return (
-                <button key={btype} title={`${BUILDING_LABELS[btype]} — ${cc}💰${cu > 0 ? ` ${cu}⚔` : ""}`}
+                <button key={btype} title={`[${idx + 1}] ${BUILDING_LABELS[btype]} — ${cc}💰${cu > 0 ? ` ${cu}⚔` : ""}`}
                   disabled={!canAfford}
-                  onClick={() => { if (isActive) { setPlaceMode(null); placeModeRef.current = null; return; } setPlaceMode({ type: btype }); placeModeRef.current = { type: btype }; setBombMode(null); bombModeRef.current = null; }}
+                  onClick={() => {
+                    if (isActive) { setPlaceMode(null); placeModeRef.current = null; return; }
+                    setPlaceMode({ type: btype }); placeModeRef.current = { type: btype };
+                    setBombMode(null); bombModeRef.current = null;
+                  }}
                   className={`flex flex-col items-center justify-center w-14 h-14 rounded border transition-all relative ${isActive ? "border-yellow-400 bg-yellow-400/20" : "border-border/60 bg-background/60 hover:bg-secondary/80"} disabled:opacity-35 disabled:cursor-not-allowed`}>
                   <span className="absolute top-0.5 left-1 text-[9px] text-muted-foreground font-mono">{idx + 1}</span>
                   <span className="text-lg">{BUILDING_ICONS[btype]}</span>
-                  <span className="text-[9px] font-mono text-muted-foreground">{count} · {cc}💰</span>
+                  <span className="text-[9px] font-mono text-muted-foreground">{count > 0 ? `${count}x · ` : ""}{cc}💰</span>
                 </button>
               );
             })}
@@ -1105,7 +1224,11 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
               const icons: Record<BombType, string> = { atom: "☢", hydrogen: "💥", dirty: "☣" };
               return (
                 <button key={bt} title={`${bt} bomb — ${cost}💰`} disabled={!me || (me.coins || 0) < cost}
-                  onClick={() => { if (isActive) { setBombMode(null); bombModeRef.current = null; return; } setBombMode(bt); bombModeRef.current = bt; setPlaceMode(null); placeModeRef.current = null; }}
+                  onClick={() => {
+                    if (isActive) { setBombMode(null); bombModeRef.current = null; return; }
+                    setBombMode(bt); bombModeRef.current = bt;
+                    setPlaceMode(null); placeModeRef.current = null;
+                  }}
                   className={`flex flex-col items-center justify-center w-14 h-14 rounded border transition-all ${isActive ? "border-red-400 bg-red-400/20" : "border-red-800/60 bg-background/60 hover:bg-red-900/30"} disabled:opacity-35 disabled:cursor-not-allowed`}>
                   <span className="text-lg">{icons[bt]}</span>
                   <span className="text-[9px] font-mono text-red-400">{cost}💰</span>
@@ -1126,17 +1249,20 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
               </div>
             )}
             <div className="h-8 w-px bg-border" />
-            {/* Unit type */}
+
+            {/* Unit type — Q/E/R shortcuts */}
             <div className="flex flex-col items-center gap-0.5">
-              <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Unit</span>
+              <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Unit [Q/E/R]</span>
               <div className="flex gap-1">
-                {(["infantry", "tank", "warship"] as UnitType[]).map(ut => {
+                {(["infantry", "tank", "warship"] as UnitType[]).map((ut, ki) => {
                   const icons: Record<UnitType, string> = { infantry: "🪖", tank: "🚜", warship: "🚢" };
+                  const keys = ["Q", "E", "R"];
                   const cost = UNIT_COST[ut];
                   return (
-                    <button key={ut} title={`${ut}${cost ? ` (${cost}💰/attack)` : ""} — ${UNIT_MULT[ut]}× power`}
+                    <button key={ut} title={`[${keys[ki]}] ${ut}${cost ? ` — ${cost}💰/attack` : ""} — ${UNIT_MULT[ut]}× power`}
                       onClick={() => { setUnitType(ut); unitTypeRef.current = ut; }}
-                      className={`flex items-center justify-center w-9 h-9 rounded border text-base transition-all ${unitType === ut ? "border-primary bg-primary/20" : "border-border/60 bg-background/60 hover:bg-secondary/80"}`}>
+                      className={`flex flex-col items-center justify-center w-9 h-9 rounded border text-sm transition-all relative ${unitType === ut ? "border-primary bg-primary/20" : "border-border/60 bg-background/60 hover:bg-secondary/80"}`}>
+                      <span className="absolute top-0 left-0.5 text-[8px] text-muted-foreground">{keys[ki]}</span>
                       {icons[ut]}
                     </button>
                   );
@@ -1144,22 +1270,35 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
               </div>
             </div>
             <div className="h-8 w-px bg-border" />
-            {/* Attack slider */}
+
+            {/* Attack ratio slider */}
             <div className="flex flex-col items-center gap-0.5">
-              <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Attack %</span>
+              <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Attack Ratio</span>
               <div className="flex items-center gap-1.5">
-                <input type="range" min={5} max={100} step={5} value={sendPct} onChange={e => setSendPct(+e.target.value)} className="w-24 accent-primary" />
+                <input type="range" min={5} max={100} step={5} value={sendPct}
+                  onChange={e => { setSendPct(+e.target.value); sendPctRef.current = +e.target.value; }}
+                  className="w-24 accent-primary" />
                 <span className="w-10 text-right font-mono text-xs font-bold text-primary">{sendPct}%</span>
               </div>
-              <span className="text-[10px] font-mono text-muted-foreground">{sendingUnits}⚔</span>
             </div>
             <div className="h-8 w-px bg-border" />
+
             {/* Camera buttons */}
             <div className="flex gap-1">
               {[
                 { title: "Zoom in", label: "+", fn: () => { const c = camRef.current; c.zoom = Math.min(10, c.zoom * 1.25); } },
                 { title: "Zoom out", label: "−", fn: () => { const c = camRef.current; c.zoom = Math.max(0.3, c.zoom * 0.8); } },
-                { title: "Reset (⌂)", label: "⌂", fn: () => { camRef.current = { x: 0, y: 0, zoom: 1 }; } },
+                { title: "Reset view", label: "⌂", fn: () => { camRef.current = { x: 0, y: 0, zoom: 1 }; } },
+                { title: "Center on me [C]", label: "C", fn: () => {
+                    const myIdx2 = playerIndexRef.current.get(playerId); if (myIdx2 === undefined) return;
+                    const gr = ownerGridRef.current; let sx = 0, sy = 0, cnt = 0;
+                    for (let i = 0; i < gr.length; i++) if (gr[i] === myIdx2) { sx += i % GRID_W; sy += Math.floor(i / GRID_W); cnt++; }
+                    if (cnt === 0) return;
+                    const mr2 = mapRectRef.current; const cv = canvasRef.current;
+                    const wx = mr2.x + (sx / cnt / GRID_W) * mr2.w, wy = mr2.y + (sy / cnt / GRID_H) * mr2.h;
+                    camRef.current.x = (cv?.width ?? 0) / 2 - wx * camRef.current.zoom;
+                    camRef.current.y = (cv?.height ?? 0) / 2 - wy * camRef.current.zoom;
+                  }},
               ].map(b => (
                 <button key={b.label} title={b.title} onClick={b.fn}
                   className="flex h-7 w-7 items-center justify-center rounded border border-border bg-background/60 text-sm hover:bg-secondary">
@@ -1169,64 +1308,13 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
             </div>
             <div className="h-8 w-px bg-border" />
             <div className="text-[9px] text-muted-foreground leading-tight">
-              <div>WASD / Arrows: pan</div>
-              <div>C: center on you</div>
-              <div>Scroll: zoom</div>
+              <div>WASD/Arrows: pan</div>
+              <div>Esc: cancel</div>
+              <div>1-8: buildings</div>
             </div>
           </div>
         </div>
       )}
-
-      {/* Radial menu */}
-      {radialMenu && (() => {
-        const cx = radialMenu.screenX, cy = radialMenu.screenY;
-        const me2 = playersRef.current.get(playerId);
-        const myIdx2 = playerIndexRef.current.get(playerId);
-        const R = 72;
-        type Sector = { label: string; icon: string; angle: number; action: () => void; disabled?: boolean; color?: string };
-        const sectors: Sector[] = [
-          { label: "Build", icon: "🔨", angle: -90, disabled: !radialMenu.isOwnTerritory, action: () => { setRadialMenu(null); notify("Select a building from the toolbar, then click your territory", "info"); } },
-          {
-            label: "Attack", icon: "⚔️", angle: 0, color: "#ef4444",
-            disabled: !radialMenu.isLand || radialMenu.isOwnTerritory || !me2,
-            action: () => { setRadialMenu(null); if (!me2 || myIdx2 === undefined) return; launchPush(radialMenu.gy * GRID_W + radialMenu.gx, myIdx2, playerId); }
-          },
-          {
-            label: "Bomb", icon: "💣", angle: 90, color: "#f97316",
-            disabled: !hasSilo || !me2,
-            action: () => {
-              setRadialMenu(null);
-              const affordable = (["atom", "hydrogen", "dirty"] as BombType[]).filter(bt => (me2?.coins || 0) >= BOMB_COST[bt]);
-              if (!affordable.length) { notify("Need a Missile Silo & coins", "error"); return; }
-              setBombMode(affordable[0]); bombModeRef.current = affordable[0];
-              notify(`${affordable[0]} bomb selected — click target`, "info");
-            }
-          },
-          {
-            label: "Naval", icon: "🚢", angle: 180, color: "#06b6d4",
-            disabled: !radialMenu.isLand || radialMenu.isOwnTerritory || !me2 || !buildingsRef.current.some(b => b.ownerIdx === myIdx2 && b.type === "port"),
-            action: () => { setRadialMenu(null); if (!me2 || myIdx2 === undefined) return; launchShip(radialMenu.gy * GRID_W + radialMenu.gx, myIdx2, playerId); }
-          },
-        ];
-        return (
-          <div className="fixed z-50 pointer-events-none" style={{ top: 0, left: 0, width: "100vw", height: "100vh" }}>
-            <div className="absolute inset-0 pointer-events-auto" onClick={() => setRadialMenu(null)} />
-            <div className="absolute w-2 h-2 rounded-full bg-white/60 -translate-x-1/2 -translate-y-1/2 pointer-events-none" style={{ left: cx, top: cy }} />
-            {sectors.map(sec => {
-              const rad = sec.angle * (Math.PI / 180);
-              const bx = cx + Math.cos(rad) * R, by = cy + Math.sin(rad) * R;
-              return (
-                <button key={sec.label} disabled={sec.disabled} onClick={sec.disabled ? undefined : sec.action}
-                  className={`absolute pointer-events-auto flex flex-col items-center justify-center w-16 h-16 rounded-full border-2 backdrop-blur-md shadow-xl -translate-x-1/2 -translate-y-1/2 transition-all duration-150 ${sec.disabled ? "border-border/30 bg-card/40 opacity-40 cursor-not-allowed" : "border-border/80 bg-card/90 hover:scale-110 cursor-pointer"}`}
-                  style={{ left: bx, top: by, borderColor: sec.disabled ? undefined : sec.color }}>
-                  <span className="text-xl leading-none">{sec.icon}</span>
-                  <span className="text-[10px] font-bold mt-0.5" style={{ color: sec.color }}>{sec.label}</span>
-                </button>
-              );
-            })}
-          </div>
-        );
-      })()}
     </div>
   );
 }
