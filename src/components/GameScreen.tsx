@@ -311,6 +311,74 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         drawBuildingIcon(px, py, b.type, owner?.color ?? "#fff");
       });
 
+      // ── Nameplates ────────────────────────────────────────────────────────
+      // For each player with territory, compute the centroid of their cells and
+      // draw a name tag. Only shown when zoomed in enough that they don't crowd.
+      if (cam.zoom > 0.6) {
+        const nameplateScale = Math.min(1, cam.zoom); // don't blow up at high zoom
+        const fontSize = Math.round(11 * nameplateScale);
+        ctx.save();
+        ctx.font = `bold ${fontSize}px sans-serif`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+
+        // Accumulate centroid sums per player index
+        const sumX = new Float64Array(colorsRef.current.length);
+        const sumY = new Float64Array(colorsRef.current.length);
+        const countP = new Int32Array(colorsRef.current.length);
+        for (let i = 0; i < grid.length; i++) {
+          const o = grid[i];
+          if (o < 0 || o >= colorsRef.current.length) continue;
+          sumX[o] += i % GRID_W;
+          sumY[o] += Math.floor(i / GRID_W);
+          countP[o]++;
+        }
+
+        playerIndexRef.current.forEach((idx, pid) => {
+          if (countP[idx] < 6) return; // too small to label
+          const p = playersRef.current.get(pid);
+          if (!p || !p.alive) return;
+
+          const cx = sumX[idx] / countP[idx];
+          const cy = sumY[idx] / countP[idx];
+          // Map grid coords → canvas coords (pre-camera-transform, since we're inside ctx.save/translate/scale)
+          const sx = mx + (cx / GRID_W) * mw;
+          const sy = my + (cy / GRID_H) * mh;
+
+          const label = p.name;
+          const textW = ctx.measureText(label).width;
+          const pad = 4;
+          const bh = fontSize + pad * 2;
+          const bw = textW + pad * 2;
+
+          // Pill background
+          ctx.fillStyle = "rgba(0,0,0,0.62)";
+          ctx.beginPath();
+          ctx.roundRect(sx - bw / 2, sy - bh / 2, bw, bh, bh / 2);
+          ctx.fill();
+
+          // Coloured left accent bar
+          ctx.fillStyle = p.color;
+          ctx.beginPath();
+          ctx.roundRect(sx - bw / 2, sy - bh / 2, 3, bh, [bh / 2, 0, 0, bh / 2]);
+          ctx.fill();
+
+          // Name text
+          ctx.fillStyle = "#ffffff";
+          ctx.fillText(label, sx + 2, sy);
+
+          // Unit count below name (only when zoomed in)
+          if (cam.zoom > 1.2) {
+            const unitLabel = `${p.units}u`;
+            ctx.font = `${Math.round(9 * nameplateScale)}px sans-serif`;
+            ctx.fillStyle = "rgba(255,255,255,0.65)";
+            ctx.fillText(unitLabel, sx + 2, sy + fontSize);
+            ctx.font = `bold ${fontSize}px sans-serif`; // restore for next player
+          }
+        });
+        ctx.restore();
+      }
+
       ctx.restore();
     }
 
@@ -439,109 +507,130 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
       channelRef.current?.send({ type: "broadcast", event: "claim", payload: claims });
   }
 
-  // Execute an attack: BFS shortest-path march from nearest owned border to target,
-  // claiming every cube along the way (cost per cube). Leftover units flood adjacent
-  // empty cubes from the target outward.
-  function executeAttack(targetIdx: number, sendUnits: number, ownerIdx: number, ownerPid: string, currentUnits: number) {
+  // ─── PRESSURE FLOOD ATTACK ───────────────────────────────────────────────
+  // Models territory like a liquid under pressure. Units pour outward from your
+  // ENTIRE border at once, biased toward the target cell (nearest cells processed
+  // first). The flood spreads in every direction simultaneously — clicking a
+  // distant point directs the flow, but pressure also spills into easy adjacent
+  // empty cells along the way. When pressure runs out the front stalls visibly.
+  function executeAttack(
+    targetIdx: number,
+    sendUnits: number,
+    ownerIdx: number,
+    ownerPid: string,
+    currentUnits: number
+  ) {
     const mask = landMaskRef.current;
     if (!mask) return { spent: 0, captured: 0, repelled: false };
     const grid = ownerGridRef.current;
     const blds = buildingsRef.current;
 
-    // Owned land cubes
-    const ownedSet = new Set<number>();
-    for (let i = 0; i < grid.length; i++) if (grid[i] === ownerIdx) ownedSet.add(i);
-    if (ownedSet.size === 0) return { spent: 0, captured: 0, repelled: false };
-
-    // BFS from all owned cubes to target through land. Track parents for path.
-    const parent = new Int32Array(grid.length).fill(-1);
+    // ── 1. Collect border frontier (owned cells with at least one non-owned neighbour) ──
     const visited = new Uint8Array(grid.length);
-    const queue: number[] = [];
-    ownedSet.forEach((i) => { visited[i] = 1; queue.push(i); });
+    const seedQueue: number[] = [];
+    let hasOwned = false;
 
-    let found = false;
-    let head = 0;
-    while (head < queue.length) {
-      const cur = queue[head++];
-      if (cur === targetIdx) { found = true; break; }
-      const x = cur % GRID_W, y = Math.floor(cur / GRID_W);
+    for (let i = 0; i < grid.length; i++) {
+      if (grid[i] !== ownerIdx) continue;
+      hasOwned = true;
+      visited[i] = 1; // mark owned cells so they are never re-processed
+      const x = i % GRID_W, y = Math.floor(i / GRID_W);
       for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]] as const) {
         const nx = x+dx, ny = y+dy;
         if (nx<0||ny<0||nx>=GRID_W||ny>=GRID_H) continue;
         const ni = ny*GRID_W+nx;
-        if (visited[ni]) continue;
-        if (!mask[ni]) continue; // land only
-        visited[ni] = 1;
-        parent[ni] = cur;
-        queue.push(ni);
+        if (!visited[ni] && mask[ni] && grid[ni] !== ownerIdx) {
+          visited[ni] = 1;
+          seedQueue.push(ni);
+        }
       }
     }
+    if (!hasOwned) return { spent: 0, captured: 0, repelled: false };
+    if (seedQueue.length === 0) return { spent: 0, captured: 0, repelled: false, unreachable: true };
 
-    if (!found) {
-      return { spent: 0, captured: 0, repelled: false, unreachable: true };
-    }
-
-    // Walk back from target to first owned cube to build the path
-    const path: number[] = [];
-    let cursor = targetIdx;
-    while (cursor !== -1 && !ownedSet.has(cursor)) {
-      path.push(cursor);
-      cursor = parent[cursor];
-    }
-    path.reverse(); // from near-border outward to target
-
-    // Spend units along path
-    let remaining = sendUnits;
-    const claims: { i: number; o: number }[] = [];
-    let captured = 0;
-    let repelledAt = -1;
-
-    for (const ni of path) {
-      const cur = grid[ni];
-      let cost: number;
-      if (cur === -1) {
-        cost = COST_EMPTY;
-      } else if (cur === ownerIdx) {
-        continue; // already ours (rare during multi-hop)
-      } else {
-        const hasFort = blds.some((b) => b.gridIdx === ni && b.type === "fort");
-        // Defender unit-density bonus: enemy with more units defends harder
-        const defEntry = [...playerIndexRef.current.entries()].find(([, v]) => v === cur);
-        const def = defEntry ? playersRef.current.get(defEntry[0]) : null;
-        const defStrength = def ? Math.max(1, Math.sqrt(def.units) / 4) : 1;
-        cost = Math.ceil(COST_ENEMY_BASE * (hasFort ? FORT_DEFENSE : 1) * defStrength);
-      }
-      if (remaining < cost) { repelledAt = ni; break; }
-      remaining -= cost;
-      grid[ni] = ownerIdx;
-      claims.push({ i: ni, o: ownerIdx });
-      captured++;
-    }
-
-    // Flood leftover units around the target (claiming empty / cheap cubes)
-    if (remaining > 0 && captured > 0) {
-      const floodSeen = new Uint8Array(grid.length);
-      const floodQ: number[] = [targetIdx];
-      floodSeen[targetIdx] = 1;
-      while (floodQ.length > 0 && remaining >= COST_EMPTY) {
-        const cur = floodQ.shift()!;
+    // ── 2. Check reachability: can we BFS from border to target at all? ──
+    // (quick check before the expensive priority flood)
+    {
+      const reach = new Uint8Array(grid.length);
+      const q: number[] = [...seedQueue];
+      q.forEach(i => reach[i] = 1);
+      let reachable = false;
+      let h = 0;
+      while (h < q.length) {
+        const cur = q[h++];
+        if (cur === targetIdx) { reachable = true; break; }
         const x = cur % GRID_W, y = Math.floor(cur / GRID_W);
         for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]] as const) {
           const nx = x+dx, ny = y+dy;
           if (nx<0||ny<0||nx>=GRID_W||ny>=GRID_H) continue;
           const ni = ny*GRID_W+nx;
-          if (floodSeen[ni] || !mask[ni]) continue;
-          floodSeen[ni] = 1;
-          if (grid[ni] === ownerIdx) { floodQ.push(ni); continue; }
-          if (grid[ni] === -1) {
-            if (remaining < COST_EMPTY) continue;
-            remaining -= COST_EMPTY;
-            grid[ni] = ownerIdx;
-            claims.push({ i: ni, o: ownerIdx });
-            captured++;
-            floodQ.push(ni);
-          }
-          // Don't auto-fight enemies during flood — leftover only paints empty
+          if (!reach[ni] && mask[ni]) { reach[ni] = 1; q.push(ni); }
+        }
+      }
+      if (!reachable) return { spent: 0, captured: 0, repelled: false, unreachable: true };
+    }
+
+    // ── 3. Pressure flood with distance-to-target priority ──
+    // Bucket queue sorted by Manhattan distance to target — nearest processed first.
+    // This naturally directs the flow toward where you clicked while still
+    // letting the flood spill into any cheap adjacent cells along the way.
+    const tx = targetIdx % GRID_W, ty = Math.floor(targetIdx / GRID_W);
+    const maxDist = GRID_W + GRID_H;
+    const buckets: number[][] = Array.from({ length: maxDist + 1 }, () => []);
+    for (const ni of seedQueue) {
+      const d = Math.abs(ni % GRID_W - tx) + Math.abs(Math.floor(ni / GRID_W) - ty);
+      buckets[Math.min(d, maxDist)].push(ni);
+    }
+
+    // Defender strength cache
+    const defCache = new Map<number, number>();
+    function defStr(defIdx: number) {
+      if (defCache.has(defIdx)) return defCache.get(defIdx)!;
+      const entry = [...playerIndexRef.current.entries()].find(([, v]) => v === defIdx);
+      const p = entry ? playersRef.current.get(entry[0]) : null;
+      const s = p ? Math.max(1, Math.sqrt(p.units) / 5) : 1;
+      defCache.set(defIdx, s);
+      return s;
+    }
+
+    let pressure = sendUnits;
+    const claims: { i: number; o: number }[] = [];
+    let captured = 0;
+    let reachedTarget = false;
+
+    outer:
+    for (let d = 0; d <= maxDist && pressure > 0; d++) {
+      const bucket = buckets[d];
+      if (!bucket || bucket.length === 0) continue;
+      for (let bi = 0; bi < bucket.length && pressure > 0; bi++) {
+        const ni = bucket[bi];
+        const cur = grid[ni];
+        if (cur === ownerIdx) continue; // already ours (shouldn't happen but guard)
+
+        // Cost to absorb this cell
+        const hasFort = cur !== -1 && blds.some((b) => b.gridIdx === ni && b.type === "fort");
+        const cost = cur === -1
+          ? COST_EMPTY
+          : Math.ceil(COST_ENEMY_BASE * (hasFort ? FORT_DEFENSE : 1) * defStr(cur));
+
+        if (pressure < cost) continue; // not enough pressure — fluid skips, finds easier path
+
+        pressure -= cost;
+        grid[ni] = ownerIdx;
+        claims.push({ i: ni, o: ownerIdx });
+        captured++;
+        if (ni === targetIdx) reachedTarget = true;
+
+        // Expand newly claimed cell's neighbours into buckets
+        const x = ni % GRID_W, y = Math.floor(ni / GRID_W);
+        for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]] as const) {
+          const nx = x+dx, ny = y+dy;
+          if (nx<0||ny<0||nx>=GRID_W||ny>=GRID_H) continue;
+          const ni2 = ny*GRID_W+nx;
+          if (visited[ni2] || !mask[ni2] || grid[ni2] === ownerIdx) continue;
+          visited[ni2] = 1;
+          const d2 = Math.abs(nx - tx) + Math.abs(ny - ty);
+          buckets[Math.min(d2, maxDist)].push(ni2);
         }
       }
     }
@@ -549,7 +638,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     if (claims.length > 0)
       channelRef.current?.send({ type: "broadcast", event: "claim", payload: claims });
 
-    const actuallySpent = sendUnits - remaining;
+    const actuallySpent = sendUnits - pressure;
     const newUnits = Math.max(0, currentUnits - actuallySpent);
     const playerObj = playersRef.current.get(ownerPid);
     if (playerObj) playerObj.units = newUnits;
@@ -557,7 +646,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
       .update({ units: newUnits })
       .eq("lobby_id", lobby.id).eq("player_id", ownerPid);
 
-    return { spent: actuallySpent, captured, repelled: repelledAt !== -1 && captured === 0, unreachable: false };
+    return { spent: actuallySpent, captured, repelled: captured === 0, reachedTarget, unreachable: false };
   }
 
   // CLICK — either plant starter (if no territory) or attack target cube
@@ -597,9 +686,9 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     if (sending < COST_EMPTY) { showNotif("Not enough units", "error"); return; }
 
     const result = executeAttack(i, sending, myIdx, playerId, me.units);
-    if (result.unreachable) { showNotif("No land path to that cube", "error"); return; }
-    if (result.captured === 0) { showNotif("Attack repelled — too well defended", "error"); return; }
-    if (result.repelled) showNotif(`Captured ${result.captured} cubes — march halted`, "info");
+    if (result.unreachable) { showNotif("No land path to that point", "error"); return; }
+    if (result.captured === 0) { showNotif("Pressure repelled — enemy too strong", "error"); return; }
+    if (!result.reachedTarget) showNotif(`Flooded ${result.captured} cells — pressure stalled short of target`, "info");
   }
 
   function handleContextMenu(e: React.MouseEvent) {
