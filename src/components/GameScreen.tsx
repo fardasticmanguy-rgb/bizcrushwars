@@ -506,13 +506,6 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         if (pl) pl.units = Math.max(0, pl.units - Math.round(cost));
       });
 
-
-              grid[ni] = myIdx;
-              claims.push({ i: ni, o: myIdx });
-            }
-          }
-        }
-      });
       if (claims.length > 0)
         channelRef.current?.send({ type: "broadcast", event: "claim", payload: claims });
     }
