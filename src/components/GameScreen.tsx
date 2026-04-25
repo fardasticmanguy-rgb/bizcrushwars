@@ -47,13 +47,15 @@ const DIFFICULTY_REGEN: Record<string, number> = {
   intense: 1.5,
 };
 
-// Costs per cube during a march
-const COST_EMPTY = 1;       // claim an empty cube
-const COST_ENEMY_BASE = 4;  // claim an enemy cube (multiplied by fort defense)
-const FORT_DEFENSE = 3;     // enemy fort cubes cost N× more
-const FACTORY_INCOME = 6;   // units per sync per factory
-const STARTER_RADIUS = 2;   // starter cluster size
-const BUILD_COST: Record<BuildingType, number> = { fort: 120, factory: 180 };
+// Costs per cell during flood
+const COST_EMPTY = 1;         // claim an empty/neutral cell
+const COST_ENEMY_BASE = 3;    // claim an enemy cell (slightly cheaper than before)
+const FORT_DEFENSE = 2.5;     // fort multiplier
+const FACTORY_INCOME = 6;     // units per sync per factory
+const STARTER_RADIUS = 1;     // starter cluster — 3×3 now instead of 5×5
+const BUILD_COST: Record<BuildingType, number> = { fort: 80, factory: 140 };
+// Cells revealed per animation frame — controls flood speed feel
+const FLOOD_CELLS_PER_FRAME = 8;
 
 type CtxMenu = {
   screenX: number;
@@ -63,6 +65,8 @@ type CtxMenu = {
   isOwnTerritory: boolean;
   isLand: boolean;
 } | null;
+
+type Particle = { x: number; y: number; vx: number; vy: number; life: number; color: string };
 
 export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -98,6 +102,12 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
   const dragRef = useRef({ active: false, startX: 0, startY: 0, camX: 0, camY: 0 });
   const dragMovedRef = useRef(false);
   const mapRectRef = useRef({ x: 0, y: 0, w: 0, h: 0 });
+
+  // Pending flood cells to animate. executeAttack computes claims instantly
+  // (pressure math is synchronous) but queues them here so the render loop
+  // reveals them gradually — FLOOD_CELLS_PER_FRAME per frame.
+  const floodQueueRef = useRef<Array<[number, number]>>([]);
+  const particlesRef = useRef<Particle[]>([]);
 
   const screenToGrid = useCallback((sx: number, sy: number) => {
     const canvas = canvasRef.current;
@@ -379,43 +389,112 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         ctx.restore();
       }
 
-      ctx.restore();
+      ctx.restore(); // end camera transform
+
+      // ── Particles (screen space, after camera restore) ───────────────────
+      for (const p of particlesRef.current) {
+        ctx.globalAlpha = p.life * 0.85;
+        ctx.fillStyle = p.color;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 2 + p.life * 2, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
     }
 
     function loop(now: number) {
+      // ── Drain flood animation queue ──────────────────────────────────────
+      // Claims were pre-computed synchronously; we reveal them gradually here.
+      const fq = floodQueueRef.current;
+      const grid = ownerGridRef.current;
+      const mr = mapRectRef.current;
+      if (fq.length > 0) {
+        const batch = fq.splice(0, FLOOD_CELLS_PER_FRAME);
+        for (const [ci, oi] of batch) {
+          grid[ci] = oi;
+          // Spawn 2 particles at this cell for visual fizz
+          // world coords → screen coords (apply camera transform)
+          const wx2 = mr.x + ((ci % GRID_W) + 0.5) / GRID_W * mr.w;
+          const wy2 = mr.y + (Math.floor(ci / GRID_W) + 0.5) / GRID_H * mr.h;
+          const cam2 = camRef.current;
+          const cx2 = cam2.x + wx2 * cam2.zoom;
+          const cy2 = cam2.y + wy2 * cam2.zoom;
+          const ownerEntry2 = [...playerIndexRef.current.entries()].find(([, v]) => v === oi);
+          const ownerP = ownerEntry2 ? playersRef.current.get(ownerEntry2[0]) : null;
+          const col = ownerP?.color ?? "#fff";
+          for (let pi = 0; pi < 3; pi++) {
+            const ang = Math.random() * Math.PI * 2;
+            const spd = 0.3 + Math.random() * 0.6;
+            particlesRef.current.push({
+              x: cx2, y: cy2,
+              vx: Math.cos(ang) * spd,
+              vy: Math.sin(ang) * spd,
+              life: 1,
+              color: col,
+            });
+          }
+        }
+        // Broadcast the batch claims to other players
+        if (batch.length > 0)
+          channelRef.current?.send({ type: "broadcast", event: "claim", payload: batch.map(([i, o]) => ({ i, o })) });
+      }
+
+      // ── Update particles ─────────────────────────────────────────────────
+      const cam = camRef.current;
+      particlesRef.current = particlesRef.current.filter(p => {
+        p.x += p.vx * cam.zoom;
+        p.y += p.vy * cam.zoom;
+        p.life -= 0.04;
+        return p.life > 0;
+      });
+
       render();
 
       if (now - lastSyncRef.current > 1500) { lastSyncRef.current = now; syncStats(); }
 
-      // Bots act periodically — simple "click random enemy/empty cube on frontier"
-      if (lobby.host_id === playerId && now - lastBotMoveRef.current > 2200) {
+      // ── Bot AI ───────────────────────────────────────────────────────────
+      if (lobby.host_id === playerId && now - lastBotMoveRef.current > 1800) {
         lastBotMoveRef.current = now;
         const mask = landMaskRef.current;
         if (mask) {
-          const grid = ownerGridRef.current;
           playersRef.current.forEach((bot) => {
             if (!bot.is_bot || !bot.alive) return;
             const idx = playerIndexRef.current.get(bot.player_id);
             if (idx === undefined) return;
 
-            // Find bot territory
+            // Plant starter if no territory
             const owned: number[] = [];
             for (let i = 0; i < grid.length; i++) if (grid[i] === idx) owned.push(i);
-
-            // If bot has nothing yet, plant starter
             if (owned.length === 0) {
               const candidates: number[] = [];
               for (let i = 0; i < mask.length; i++)
                 if (mask[i] && grid[i] === -1) candidates.push(i);
               if (candidates.length === 0) return;
-              const seed = candidates[Math.floor(Math.random() * candidates.length)];
-              plantStarter(seed, idx);
+              plantStarter(candidates[Math.floor(Math.random() * candidates.length)], idx);
               return;
             }
-            if (bot.units < 30) return;
 
-            // Find a frontier target: adjacent unowned/enemy cube
-            const frontierTargets: number[] = [];
+            // Build when rich enough — bots build too
+            if (bot.units > 150 && buildingsRef.current.filter(b => b.ownerIdx === idx).length < 3) {
+              const myLand = owned[Math.floor(Math.random() * owned.length)];
+              if (!buildingsRef.current.some(b => b.gridIdx === myLand)) {
+                const btype: BuildingType = bot.units > 300 ? "factory" : "fort";
+                const cost2 = BUILD_COST[btype];
+                if (bot.units >= cost2) {
+                  const bld: Building = { type: btype, ownerIdx: idx, gridIdx: myLand };
+                  buildingsRef.current = [...buildingsRef.current, bld];
+                  setBuildings(prev => [...prev, bld]);
+                  channelRef.current?.send({ type: "broadcast", event: "building", payload: bld });
+                  bot.units -= cost2;
+                }
+              }
+            }
+
+            if (bot.units < 20) return;
+
+            // Find frontier cells — split by neutral vs enemy
+            const neutralFrontier: number[] = [];
+            const enemyFrontier: number[] = [];
             for (const i of owned) {
               const x = i % GRID_W, y = Math.floor(i / GRID_W);
               for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]] as const) {
@@ -423,12 +502,26 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
                 if (nx<0||ny<0||nx>=GRID_W||ny>=GRID_H) continue;
                 const ni = ny*GRID_W+nx;
                 if (!mask[ni]) continue;
-                if (grid[ni] !== idx) frontierTargets.push(ni);
+                if (grid[ni] === -1) neutralFrontier.push(ni);
+                else if (grid[ni] !== idx) enemyFrontier.push(ni);
               }
             }
-            if (frontierTargets.length === 0) return;
-            const target = frontierTargets[Math.floor(Math.random() * frontierTargets.length)];
-            const sendUnits = Math.floor(bot.units * (0.4 + Math.random() * 0.3));
+
+            // Decision: prefer neutral expansion; only fight enemies when strong
+            let target = -1;
+            let sendFrac = 0.35;
+            if (neutralFrontier.length > 0 && bot.units > 50) {
+              // Expand into neutral — pick a random neutral neighbour
+              target = neutralFrontier[Math.floor(Math.random() * neutralFrontier.length)];
+              sendFrac = 0.3 + Math.random() * 0.2;
+            } else if (enemyFrontier.length > 0 && bot.units > 200) {
+              // Attack a weakly-defended enemy tile
+              target = enemyFrontier[Math.floor(Math.random() * enemyFrontier.length)];
+              sendFrac = 0.5 + Math.random() * 0.3;
+            }
+            if (target === -1) return;
+
+            const sendUnits = Math.max(5, Math.floor(bot.units * sendFrac));
             executeAttack(target, sendUnits, idx, bot.player_id, bot.units);
           });
         }
@@ -607,11 +700,19 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         const cur = grid[ni];
         if (cur === ownerIdx) continue; // already ours (shouldn't happen but guard)
 
-        // Cost to absorb this cell
+        // Cost to absorb this cell.
+        // KEY: neutral tiles far from the target corridor are expensive until
+        // the target is reached — this stops the flood wasting units by
+        // painting random empty land sideways instead of driving toward the click.
         const hasFort = cur !== -1 && blds.some((b) => b.gridIdx === ni && b.type === "fort");
-        const cost = cur === -1
-          ? COST_EMPTY
-          : Math.ceil(COST_ENEMY_BASE * (hasFort ? FORT_DEFENSE : 1) * defStr(cur));
+        let cost: number;
+        if (cur === -1) {
+          // Neutral: cheap in the corridor (d <= 3), expensive off to the sides
+          const offAxis = reachedTarget ? 0 : Math.max(0, d - 2);
+          cost = COST_EMPTY + Math.floor(offAxis * 1.5);
+        } else {
+          cost = Math.ceil(COST_ENEMY_BASE * (hasFort ? FORT_DEFENSE : 1) * defStr(cur));
+        }
 
         if (pressure < cost) continue; // not enough pressure — fluid skips, finds easier path
 
@@ -635,8 +736,11 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
       }
     }
 
-    if (claims.length > 0)
-      channelRef.current?.send({ type: "broadcast", event: "claim", payload: claims });
+    // Revert the instant grid writes and push to the animation queue instead.
+    // The render loop drains floodQueueRef at FLOOD_CELLS_PER_FRAME/frame,
+    // writes to the real grid, spawns particles, and broadcasts each batch.
+    for (const { i } of claims) ownerGridRef.current[i] = -1;
+    for (const { i, o } of claims) floodQueueRef.current.push([i, o]);
 
     const actuallySpent = sendUnits - pressure;
     const newUnits = Math.max(0, currentUnits - actuallySpent);
@@ -808,7 +912,46 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
             <div className="flex items-center gap-2 text-xs">
               <span className="h-2.5 w-2.5 rounded-sm" style={{ backgroundColor: me.color }} />
               <span className="font-medium">{me.name}</span>
-              <span className="font-mono text-muted-foreground">{me.units}u · {me.pixels} cubes</span>
+              <span className="font-mono text-muted-foreground">{me.units}u · {me.pixels}t</span>
+            </div>
+            <div className="h-10 w-px bg-border" />
+            <div className="flex flex-col items-center gap-1">
+              <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Build</span>
+              <div className="flex gap-1">
+                <button
+                  title={`Fort (${BUILD_COST.fort}u) — 2.5× defense`}
+                  disabled={me.units < BUILD_COST.fort}
+                  onClick={() => {
+                    // Build on the centroid of your territory
+                    const g = ownerGridRef.current;
+                    const myI = playerIndexRef.current.get(playerId);
+                    if (myI === undefined) return;
+                    const owned2: number[] = [];
+                    for (let k = 0; k < g.length; k++) if (g[k] === myI) owned2.push(k);
+                    if (owned2.length === 0) { showNotif("No territory yet", "error"); return; }
+                    const pick = owned2[Math.floor(Math.random() * owned2.length)];
+                    doBuild(pick % GRID_W, Math.floor(pick / GRID_W), "fort");
+                  }}
+                  className="flex h-7 items-center gap-1 rounded border border-amber-500/50 bg-amber-500/10 px-2 text-xs text-amber-400 hover:bg-amber-500/20 disabled:opacity-40 disabled:cursor-not-allowed">
+                  <Shield className="h-3 w-3" /> Fort
+                </button>
+                <button
+                  title={`Factory (${BUILD_COST.factory}u) — +${FACTORY_INCOME} income`}
+                  disabled={me.units < BUILD_COST.factory}
+                  onClick={() => {
+                    const g = ownerGridRef.current;
+                    const myI = playerIndexRef.current.get(playerId);
+                    if (myI === undefined) return;
+                    const owned2: number[] = [];
+                    for (let k = 0; k < g.length; k++) if (g[k] === myI) owned2.push(k);
+                    if (owned2.length === 0) { showNotif("No territory yet", "error"); return; }
+                    const pick = owned2[Math.floor(Math.random() * owned2.length)];
+                    doBuild(pick % GRID_W, Math.floor(pick / GRID_W), "factory");
+                  }}
+                  className="flex h-7 items-center gap-1 rounded border border-blue-500/50 bg-blue-500/10 px-2 text-xs text-blue-400 hover:bg-blue-500/20 disabled:opacity-40 disabled:cursor-not-allowed">
+                  <Factory className="h-3 w-3" /> Factory
+                </button>
+              </div>
             </div>
           </>
         )}
