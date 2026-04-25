@@ -1172,8 +1172,29 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
             onClick={() => { camRef.current = { x: 0, y: 0, zoom: 1 }; }}
             className="flex h-7 w-7 items-center justify-center rounded border border-border bg-background/60 text-xs hover:bg-secondary">⌂</button>
         </div>
+        {myPorts.length > 0 && (
+          <>
+            <div className="h-8 w-px bg-border" />
+            <button
+              onClick={startNavalMode}
+              className="flex items-center gap-1.5 rounded border border-cyan-500/40 bg-cyan-950/50 px-2.5 py-1 text-xs text-cyan-300 hover:bg-cyan-900/60 transition-colors">
+              <Anchor className="h-3 w-3" /> Naval
+            </button>
+          </>
+        )}
+        {me && (
+          <>
+            <div className="h-8 w-px bg-border" />
+            <div className="flex items-center gap-2 text-xs">
+              <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: me.color }} />
+              <span className="font-medium">{me.name}</span>
+              <span className="font-mono text-muted-foreground">{me.units}u · {me.pixels}px</span>
+            </div>
+          </>
+        )}
+      </div>
 
-      {/* Right-click context menu */}
+
       {ctxMenu && (
         <div
           className="fixed z-50 min-w-[180px] overflow-hidden rounded-lg border border-border bg-card shadow-2xl"
