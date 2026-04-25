@@ -29,8 +29,8 @@ export const MAPS = [
 ];
 
 // Territory grid — higher res = smaller, more fluid-looking cells
-export const GRID_W = 320;
-export const GRID_H = 160;
+export const GRID_W = 480;
+export const GRID_H = 240;
 
 export function genCode() {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
