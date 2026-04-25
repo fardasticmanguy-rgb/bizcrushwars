@@ -455,9 +455,9 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         const bonus = Math.round(factoryBonus[idx] || 0);
         const newUnits = Math.min(9999, p.units + base + bonus);
         const alive = px > 0 || p.units > 0;
-        updates.push(supabase.from("lobby_players")
+        updates.push(Promise.resolve(supabase.from("lobby_players")
           .update({ pixels: px, units: newUnits, alive })
-          .eq("lobby_id", lobby.id).eq("player_id", p.player_id));
+          .eq("lobby_id", lobby.id).eq("player_id", p.player_id)));
       });
       await Promise.all(updates);
     }
