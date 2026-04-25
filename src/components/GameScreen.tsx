@@ -291,6 +291,23 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         });
         buildingsRef.current = [...buildingsRef.current, b];
       })
+      .on("broadcast", { event: "alliance" }, ({ payload }) => {
+        const { from, to, action } = payload as { from: string; to: string; action: "propose" | "accept" | "break" };
+        if (to !== playerId) return;
+        if (action === "propose") {
+          setPendingAlliances((prev) => prev.includes(from) ? prev : [...prev, from]);
+          const fromName = playersRef.current.get(from)?.name ?? "Player";
+          toast(`${fromName} proposes alliance — right-click their dot to accept`);
+        } else if (action === "accept") {
+          setAllies((prev) => prev.includes(from) ? prev : [...prev, from]);
+          const fromName = playersRef.current.get(from)?.name ?? "Player";
+          toast.success(`Alliance with ${fromName} formed!`);
+        } else if (action === "break") {
+          setAllies((prev) => prev.filter((x) => x !== from));
+          setPendingAlliances((prev) => prev.filter((x) => x !== from));
+          toast(`Alliance broken`);
+        }
+      })
       .subscribe();
     channelRef.current = ch;
     return () => { active = false; supabase.removeChannel(ch); channelRef.current = null; };
