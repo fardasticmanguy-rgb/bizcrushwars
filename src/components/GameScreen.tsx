@@ -4,8 +4,9 @@ import { GRID_W, GRID_H, MAPS } from "@/game/constants";
 import { loadLandMask } from "@/game/landMask";
 import worldMap from "@/assets/map-world.jpg";
 import { Button } from "@/components/ui/button";
-import { LogOut, Anchor, Shield, Factory } from "lucide-react";
-import './routes/styles.css'
+import { LogOut, Anchor, Shield, Factory, Handshake, Zap, Hand } from "lucide-react";
+import { toast } from "sonner";
+
 type Lobby = {
   id: string;
   code: string;
@@ -46,10 +47,15 @@ function hexRgb(hex: string): [number, number, number] {
 }
 
 const DIFFICULTY_SPEED: Record<string, number> = {
-  relaxed: 0.5,
-  balanced: 1.0,
-  intense: 1.8,
+  relaxed: 0.4,
+  balanced: 0.7,
+  intense: 1.1,
 };
+
+// How many units one tile claim costs (drains your army as you expand)
+const COST_PER_CLAIM = 0.35;
+// Cooldown between expansion waves (ms) — gives "pulse" feel
+const ATTACK_INTERVAL_MS = 600;
 
 // Building costs in units
 const BUILD_COST: Record<BuildingType, number> = {
@@ -70,6 +76,7 @@ type CtxMenu = {
   isOwnTerritory: boolean;
   isLand: boolean;
   nearOwnPort: boolean;
+  enemyPlayerId: string | null; // for alliance proposals
 } | null;
 
 // Naval invasion mode state
@@ -159,18 +166,30 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
   const [navalMode, setNavalMode] = useState<NavalMode>(null);
   const [buildings, setBuildings] = useState<Building[]>([]);
   const [notification, setNotification] = useState<string | null>(null);
+  const [autoMode, setAutoMode] = useState(true);
+  const [allies, setAllies] = useState<string[]>([]); // playerIds we are allied with
+  const [pendingAlliances, setPendingAlliances] = useState<string[]>([]); // incoming proposals
+  const [attackCooldown, setAttackCooldown] = useState(0); // 0..1 progress until next pulse
+
   const sendPctRef = useRef(50);
   const navalModeRef = useRef<NavalMode>(null);
   const buildingsRef = useRef<Building[]>([]);
+  const autoModeRef = useRef(true);
+  const alliesRef = useRef<string[]>([]);
+  const lastAttackRef = useRef<number>(0);
 
   useEffect(() => { sendPctRef.current = sendPct; }, [sendPct]);
   useEffect(() => { navalModeRef.current = navalMode; }, [navalMode]);
   useEffect(() => { buildingsRef.current = buildings; }, [buildings]);
+  useEffect(() => { autoModeRef.current = autoMode; }, [autoMode]);
+  useEffect(() => { alliesRef.current = allies; }, [allies]);
 
   function showNotif(msg: string) {
     setNotification(msg);
+    toast(msg);
     setTimeout(() => setNotification(null), 2500);
   }
+
 
   const ownerGridRef = useRef<Int16Array>(new Int16Array(GRID_W * GRID_H).fill(-1));
   const landMaskRef = useRef<Uint8Array | null>(null);
@@ -272,6 +291,23 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         });
         buildingsRef.current = [...buildingsRef.current, b];
       })
+      .on("broadcast", { event: "alliance" }, ({ payload }) => {
+        const { from, to, action } = payload as { from: string; to: string; action: "propose" | "accept" | "break" };
+        if (to !== playerId) return;
+        if (action === "propose") {
+          setPendingAlliances((prev) => prev.includes(from) ? prev : [...prev, from]);
+          const fromName = playersRef.current.get(from)?.name ?? "Player";
+          toast(`${fromName} proposes alliance — right-click their dot to accept`);
+        } else if (action === "accept") {
+          setAllies((prev) => prev.includes(from) ? prev : [...prev, from]);
+          const fromName = playersRef.current.get(from)?.name ?? "Player";
+          toast.success(`Alliance with ${fromName} formed!`);
+        } else if (action === "break") {
+          setAllies((prev) => prev.filter((x) => x !== from));
+          setPendingAlliances((prev) => prev.filter((x) => x !== from));
+          toast(`Alliance broken`);
+        }
+      })
       .subscribe();
     channelRef.current = ch;
     return () => { active = false; supabase.removeChannel(ch); channelRef.current = null; };
@@ -365,9 +401,13 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     const ro = new ResizeObserver(resize);
     ro.observe(container);
 
+    // Per-player accumulated unit cost from the current attack pulse
+    const pulseSpend = new Map<string, number>();
     const speed = DIFFICULTY_SPEED[lobby.difficulty] ?? 1;
+    let lastUiCooldown = 0;
 
-    function simulate(dt: number) {
+    function simulate(_dt: number) {
+      void _dt;
       const mask = landMaskRef.current;
       if (!mask) return;
       const grid = ownerGridRef.current;
@@ -375,24 +415,54 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
       if (colors.length === 0) return;
       const blds = buildingsRef.current;
 
+      const now = performance.now();
+      // Pulse cooldown progress (used by UI)
+      const since = now - lastAttackRef.current;
+      const progress = Math.min(1, since / ATTACK_INTERVAL_MS);
+      if (Math.abs(progress - lastUiCooldown) > 0.08) {
+        lastUiCooldown = progress;
+        setAttackCooldown(progress);
+      }
+      if (since < ATTACK_INTERVAL_MS) return;
+      lastAttackRef.current = now;
+      pulseSpend.clear();
+
+
       const claims: { i: number; o: number }[] = [];
+      const ally = alliesRef.current;
+      const myPid = playerId;
+      const localAuto = autoModeRef.current;
+
       playersRef.current.forEach((p) => {
         if (!p.alive) return;
         const myIdx = playerIndexRef.current.get(p.player_id);
         if (myIdx === undefined) return;
 
-        const strength = Math.min(80, (p.units / 20) * speed * (dt / 1000) * 30);
+        // Human in manual mode does NOT auto-expand — only attacks via context menu
+        if (p.player_id === myPid && !localAuto) return;
+
+        // Strength scales with army size, but is much gentler than before.
+        // Also capped so big empires don't snowball as fast.
+        const sizeFactor = Math.sqrt(Math.max(1, p.units)) / 6;
+        const strength = Math.min(14, sizeFactor * speed);
+        // Each "attempt" is one tile-claim attempt that costs COST_PER_CLAIM units on success
         const attempts = Math.floor(strength) + (Math.random() < strength % 1 ? 1 : 0);
         if (attempts <= 0) return;
+
+        // How many units this player can spend this pulse (cap at 30% of army)
+        const budget = Math.max(1, Math.floor(p.units * 0.3));
+        let spent = 0;
 
         const dotX = Math.floor(p.dot_x * GRID_W);
         const dotY = Math.floor(p.dot_y * GRID_H);
 
         for (let a = 0; a < attempts; a++) {
+          if (spent >= budget) break;
           let sx: number, sy: number;
-          if (Math.random() < 0.25) {
-            sx = dotX + Math.floor((Math.random() - 0.5) * 10);
-            sy = dotY + Math.floor((Math.random() - 0.5) * 10);
+          if (Math.random() < 0.5) {
+            // Expand from near the dot — feels like troops marching from the leader
+            sx = dotX + Math.floor((Math.random() - 0.5) * 8);
+            sy = dotY + Math.floor((Math.random() - 0.5) * 8);
           } else {
             let found = -1;
             for (let t = 0; t < 40; t++) {
@@ -403,7 +473,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
             sx = found % GRID_W;
             sy = Math.floor(found / GRID_W);
           }
-          const dirs = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[-1,-1],[1,-1],[-1,1]];
+          const dirs = [[1,0],[-1,0],[0,1],[0,-1]];
           const d = dirs[Math.floor(Math.random() * dirs.length)];
           const nx = sx + d[0]; const ny = sy + d[1];
           if (nx < 0 || ny < 0 || nx >= GRID_W || ny >= GRID_H) continue;
@@ -411,23 +481,37 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
           if (!mask[ni]) continue;
           const cur = grid[ni];
           if (cur === myIdx) continue;
+          // Don't claim allied tiles (only check from human player's POV; bots ignore)
+          if (cur >= 0 && p.player_id === myPid) {
+            const enemyEntry = [...playerIndexRef.current.entries()].find(([, v]) => v === cur);
+            if (enemyEntry && ally.includes(enemyEntry[0])) continue;
+          }
           if (cur === -1) {
             grid[ni] = myIdx;
             claims.push({ i: ni, o: myIdx });
+            spent += COST_PER_CLAIM;
           } else {
             const defEntry = [...playerIndexRef.current.entries()].find(([, v]) => v === cur);
             const def = defEntry ? playersRef.current.get(defEntry[0]) : null;
             if (!def) continue;
-            // Check for fort on this tile
             const hasFort = blds.some((b) => b.type === "fort" && b.gridIdx === ni);
             const defBonus = hasFort ? FORT_DEFENSE : 1;
-            if (p.units > def.units * 1.4 * defBonus && Math.random() < 0.25) {
+            if (p.units > def.units * 1.4 * defBonus && Math.random() < 0.18) {
               grid[ni] = myIdx;
               claims.push({ i: ni, o: myIdx });
+              spent += COST_PER_CLAIM * 2; // contested tiles cost more
             }
           }
         }
+        if (spent > 0) pulseSpend.set(p.player_id, spent);
       });
+
+      // Apply unit drain to local mirror (DB sync happens in syncStats)
+      pulseSpend.forEach((cost, pid) => {
+        const pl = playersRef.current.get(pid);
+        if (pl) pl.units = Math.max(0, pl.units - Math.round(cost));
+      });
+
       if (claims.length > 0)
         channelRef.current?.send({ type: "broadcast", event: "claim", payload: claims });
     }
@@ -454,9 +538,9 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         const bonus = Math.round(factoryBonus[idx] || 0);
         const newUnits = Math.min(9999, p.units + base + bonus);
         const alive = px > 0 || p.units > 0;
-        updates.push(supabase.from("lobby_players")
+        updates.push(Promise.resolve(supabase.from("lobby_players")
           .update({ pixels: px, units: newUnits, alive })
-          .eq("lobby_id", lobby.id).eq("player_id", p.player_id));
+          .eq("lobby_id", lobby.id).eq("player_id", p.player_id)));
       });
       await Promise.all(updates);
     }
@@ -617,6 +701,17 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         ctx.strokeStyle = "rgba(0,0,0,0.75)";
         ctx.lineWidth = 1.5;
         ctx.stroke();
+
+        // Alliance shield ring
+        if (!isMe && alliesRef.current.includes(p.player_id)) {
+          ctx.beginPath();
+          ctx.arc(px, py, 12, 0, Math.PI * 2);
+          ctx.strokeStyle = "rgba(120,200,255,0.95)";
+          ctx.lineWidth = 2;
+          ctx.setLineDash([3, 2]);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
 
         ctx.beginPath();
         ctx.arc(px, py, isMe ? 3.5 : 2.5, 0, Math.PI * 2);
@@ -791,8 +886,40 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     const isLand = mask ? !!mask[i] : false;
     const nearOwnPort = myIdx !== undefined && isNearPort(buildingsRef.current, i, myIdx);
 
-    setCtxMenu({ screenX: e.clientX, screenY: e.clientY, gx, gy, isOwnTerritory, isLand, nearOwnPort });
+    // Find nearest enemy dot within ~6 grid cells for alliance proposals
+    let enemyPlayerId: string | null = null;
+    let bestD = 6;
+    playersRef.current.forEach((p) => {
+      if (p.player_id === playerId || !p.alive) return;
+      const px = p.dot_x * GRID_W;
+      const py = p.dot_y * GRID_H;
+      const d = Math.hypot(px - gx, py - gy);
+      if (d < bestD) { bestD = d; enemyPlayerId = p.player_id; }
+    });
+
+    setCtxMenu({ screenX: e.clientX, screenY: e.clientY, gx, gy, isOwnTerritory, isLand, nearOwnPort, enemyPlayerId });
   }
+
+  // Alliance helpers
+  function proposeAlliance(targetId: string) {
+    setCtxMenu(null);
+    channelRef.current?.send({ type: "broadcast", event: "alliance", payload: { from: playerId, to: targetId, action: "propose" } });
+    showNotif("Alliance proposed");
+  }
+  function acceptAlliance(targetId: string) {
+    setCtxMenu(null);
+    setAllies((prev) => prev.includes(targetId) ? prev : [...prev, targetId]);
+    setPendingAlliances((prev) => prev.filter((x) => x !== targetId));
+    channelRef.current?.send({ type: "broadcast", event: "alliance", payload: { from: playerId, to: targetId, action: "accept" } });
+    showNotif("Alliance formed");
+  }
+  function breakAlliance(targetId: string) {
+    setCtxMenu(null);
+    setAllies((prev) => prev.filter((x) => x !== targetId));
+    channelRef.current?.send({ type: "broadcast", event: "alliance", payload: { from: playerId, to: targetId, action: "break" } });
+    showNotif("Alliance broken");
+  }
+
 
   // Attack from context menu
   async function doAttack(gx: number, gy: number) {
@@ -810,6 +937,12 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     const defEntry = [...playerIndexRef.current.entries()].find(([, v]) => v === targetOwnerIdx);
     const def = defEntry ? playersRef.current.get(defEntry[0]) : null;
     if (!def) return;
+
+    // Block attacks on allies
+    if (alliesRef.current.includes(def.player_id)) {
+      showNotif(`${def.name} is your ally — break alliance first`);
+      return;
+    }
 
     const sending = Math.max(1, Math.floor(me.units * sendPctRef.current / 100));
     const mask = landMaskRef.current;
@@ -963,6 +1096,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
               <span className="w-3 text-right text-muted-foreground">{i + 1}</span>
               <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: p.color }} />
               <span className="flex-1 truncate font-medium">{p.name}</span>
+              {allies.includes(p.player_id) && <Handshake className="h-3 w-3 text-cyan-300" />}
               <span className="font-mono text-muted-foreground">{p.pixels}</span>
             </div>
           ))}
@@ -1001,17 +1135,43 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
           </div>
         </div>
         <div className="h-8 w-px bg-border" />
-        <div className="flex gap-1">
-          {[["＋", 1.2], ["－", 0.83], ["⌂", "reset"]].map(([label, val]) => (
-            <button key={String(label)}
-              onClick={() => {
-                if (val === "reset") { camRef.current = { x: 0, y: 0, zoom: 1 }; }
-                else { const cam = camRef.current; cam.zoom = Math.min(6, Math.max(0.4, cam.zoom * Number(val))); }
-              }}
-              className="flex h-7 w-7 items-center justify-center rounded border border-border bg-background/60 text-sm hover:bg-secondary">
-              {label}
+        {/* Auto / Manual mode toggle */}
+        <div className="flex flex-col items-center gap-1">
+          <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Mode</span>
+          <div className="flex overflow-hidden rounded border border-border">
+            <button
+              onClick={() => setAutoMode(true)}
+              className={`flex items-center gap-1 px-2 py-1 text-xs transition-colors ${autoMode ? "bg-primary text-primary-foreground" : "bg-background/60 hover:bg-secondary"}`}
+            >
+              <Zap className="h-3 w-3" /> Auto
             </button>
-          ))}
+            <button
+              onClick={() => setAutoMode(false)}
+              className={`flex items-center gap-1 px-2 py-1 text-xs transition-colors ${!autoMode ? "bg-primary text-primary-foreground" : "bg-background/60 hover:bg-secondary"}`}
+            >
+              <Hand className="h-3 w-3" /> Manual
+            </button>
+          </div>
+        </div>
+        <div className="h-8 w-px bg-border" />
+        {/* Attack-pulse cooldown bar */}
+        <div className="flex flex-col items-center gap-1">
+          <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Pulse</span>
+          <div className="h-2 w-24 overflow-hidden rounded-full bg-background/60 border border-border">
+            <div className="h-full bg-primary transition-[width] duration-100" style={{ width: `${Math.round(attackCooldown * 100)}%` }} />
+          </div>
+        </div>
+        <div className="h-8 w-px bg-border" />
+        <div className="flex gap-1">
+          <button
+            onClick={() => { const c = camRef.current; c.zoom = Math.min(6, c.zoom * 1.2); }}
+            className="flex h-7 w-7 items-center justify-center rounded border border-border bg-background/60 text-sm hover:bg-secondary">+</button>
+          <button
+            onClick={() => { const c = camRef.current; c.zoom = Math.max(0.4, c.zoom * 0.83); }}
+            className="flex h-7 w-7 items-center justify-center rounded border border-border bg-background/60 text-sm hover:bg-secondary">−</button>
+          <button
+            onClick={() => { camRef.current = { x: 0, y: 0, zoom: 1 }; }}
+            className="flex h-7 w-7 items-center justify-center rounded border border-border bg-background/60 text-xs hover:bg-secondary">⌂</button>
         </div>
         {myPorts.length > 0 && (
           <>
@@ -1035,7 +1195,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         )}
       </div>
 
-      {/* Right-click context menu */}
+
       {ctxMenu && (
         <div
           className="fixed z-50 min-w-[180px] overflow-hidden rounded-lg border border-border bg-card shadow-2xl"
@@ -1106,6 +1266,26 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
             }}
               className="flex w-full items-center px-3 py-2 text-sm hover:bg-secondary text-left transition-colors border-t border-border">
               ⚓ Naval Invasion ({sendPct}%)
+            </button>
+          )}
+
+          {/* Alliance options when right-clicking near another player's dot */}
+          {ctxMenu.enemyPlayerId && !allies.includes(ctxMenu.enemyPlayerId) && !pendingAlliances.includes(ctxMenu.enemyPlayerId) && (
+            <button onClick={() => proposeAlliance(ctxMenu.enemyPlayerId!)}
+              className="flex w-full items-center px-3 py-2 text-sm hover:bg-secondary text-left transition-colors border-t border-border">
+              <Handshake className="mr-2 h-4 w-4" /> Propose Alliance
+            </button>
+          )}
+          {ctxMenu.enemyPlayerId && pendingAlliances.includes(ctxMenu.enemyPlayerId) && (
+            <button onClick={() => acceptAlliance(ctxMenu.enemyPlayerId!)}
+              className="flex w-full items-center px-3 py-2 text-sm hover:bg-secondary text-left transition-colors border-t border-border text-cyan-300">
+              <Handshake className="mr-2 h-4 w-4" /> Accept Alliance
+            </button>
+          )}
+          {ctxMenu.enemyPlayerId && allies.includes(ctxMenu.enemyPlayerId) && (
+            <button onClick={() => breakAlliance(ctxMenu.enemyPlayerId!)}
+              className="flex w-full items-center px-3 py-2 text-sm hover:bg-secondary text-left transition-colors border-t border-border text-amber-300">
+              <Handshake className="mr-2 h-4 w-4" /> Break Alliance
             </button>
           )}
 
