@@ -7,72 +7,45 @@ import { Button } from "@/components/ui/button";
 import { LogOut } from "lucide-react";
 import { toast } from "sonner";
 
-// ─── Types ───────────────────────────────────────────────────────────────────
-type Lobby = {
-  id: string; code: string; host_id: string;
-  map_id: string; difficulty: string;
-};
+// ─── Types ────────────────────────────────────────────────────────────────────
+type Lobby = { id: string; code: string; host_id: string; map_id: string; difficulty: string };
 type LobbyPlayer = {
   id: string; player_id: string; name: string; color: string;
   is_bot: boolean; dot_x: number; dot_y: number;
   units: number; coins: number; pixels: number; alive: boolean;
 };
-
-type BuildingType =
-  | "city" | "defense_post" | "port" | "fort"
-  | "factory" | "missile_silo" | "sam_launcher" | "naval_base";
-
+type BuildingType = "city" | "defense_post" | "port" | "fort" | "factory" | "missile_silo" | "sam_launcher" | "naval_base";
 type Building = { type: BuildingType; ownerIdx: number; gridIdx: number };
 type BombType = "atom" | "hydrogen" | "dirty";
-type UnitType = "infantry" | "tank" | "warship";
-
-type AttackTarget = {
-  ownerIdx: number;
-  targetIdx: number;
-  unitType: UnitType;
-};
-
-type Ship = {
-  id: string; ownerIdx: number;
-  fromX: number; fromY: number; toX: number; toY: number;
-  units: number; targetGridIdx: number; progress: number;
-  distanceTiles: number;
-};
-
+type Ship = { id: string; ownerIdx: number; fromX: number; fromY: number; toX: number; toY: number; units: number; targetGridIdx: number; progress: number; distanceTiles: number };
 type RadZone = { gridIdx: number; strength: number; decay: number };
 type PlaceMode = { type: BuildingType } | null;
 type Particle = { x: number; y: number; vx: number; vy: number; life: number; color: string };
 
-// ─── Constants ───────────────────────────────────────────────────────────────
-const DIFFICULTY_REGEN: Record<string, number> = { relaxed: 0.6, balanced: 1.0, intense: 1.5 };
+// ─── The Real Territorial.io Engine ──────────────────────────────────────────
+//
+// ONE number per player: BALANCE (troops/money/pop — it's all the same thing).
+// Balance grows via compound interest every tick, scaled by territory size.
+// Attack slider = % of balance put on the ENTIRE border simultaneously.
+// Border tiles flip when attack pressure > defense. Defense is 2× stronger.
+// Border set is maintained INCREMENTALLY — never scan the full grid.
+//
+// This is exactly how territorial.io works and why it feels alive.
 
-// ── Core attack mechanics (OpenFront / Territorial style) ─────────────────
-// No passive spreading. Territory only moves when you have an active attack target.
-// Rate scales with deployed units (your units × deploy%). Each flip costs units.
+// Interest: starts at 7% per tick, decays to ~1% over 107s. After that, territory size matters.
+const TICK_MS            = 560;      // territorial.io ticks every 560ms
+const INTEREST_INITIAL   = 0.07;     // 7% interest at game start
+const INTEREST_FLOOR     = 0.01;     // 1% floor
+const INTEREST_DECAY_MS  = 107_000;  // decay over 107 seconds
+const SOFT_CAP_MULT      = 100;      // balance soft cap = 100 × pixels
+const HARD_CAP_MULT      = 150;      // balance hard cap = 150 × pixels
+const DEFENSE_MULT       = 2.0;      // defense is 2× attack (territorial.io rule)
+const FORT_DEFENSE_BONUS = 3.0;
+const DEFPOST_BONUS      = 1.8;
+const STARTER_RADIUS     = 5;
+const SHIP_TILES_PER_MS  = 0.003;
 
-const ATTACK_SPREAD_BASE    = 0.0022;  // base flip-chance per border tile per 16ms at 500 deployed units
-const UNIT_SCALE_BASE       = 500;     // deployed units that produce base attack rate
-const FLIP_COST_NEUTRAL     = 1;       // attacker units consumed per neutral tile flip
-const FLIP_COST_ENEMY_BASE  = 5;       // attacker units consumed per enemy tile flip (× defMult)
-const FLIP_COST_DEFENDER    = 3;       // defender units consumed per lost tile
-
-const FORT_DEFENSE   = 3.0;
-const DEFPOST_MULT   = 1.8;
-const MAX_STRENGTH   = 100;
-const REGEN_RATE     = 0.15;          // slower regen — makes attacking actually drain defense
-
-// Unit multipliers on attack rate
-const UNIT_MULT: Record<UnitType, number> = { infantry: 1.0, tank: 2.2, warship: 1.4 };
-const UNIT_COST: Record<UnitType, number> = { infantry: 0, tank: 80, warship: 60 };
-
-const FACTORY_UNITS  = 8;
-const PORT_COINS     = 3;
-const CITY_COINS     = 2;
-const CITY_POP_CAP   = 500;
-const STARTER_RADIUS = 4;   // a little bigger so you can actually see yourself
-
-const SHIP_TILES_PER_MS = 0.004;
-
+// Buildings
 const BUILD_COST: Record<BuildingType, [number, number]> = {
   city: [80, 0], defense_post: [30, 20], port: [60, 0], fort: [40, 40],
   factory: [70, 0], missile_silo: [200, 0], sam_launcher: [90, 0], naval_base: [120, 0],
@@ -90,13 +63,16 @@ const BUILDING_ICONS: Record<BuildingType, string> = {
   factory: "🏭", missile_silo: "🚀", sam_launcher: "📡", naval_base: "🛳",
 };
 
+const TOOLBAR: BuildingType[] = ["city", "factory", "port", "naval_base", "defense_post", "fort", "missile_silo", "sam_launcher"];
+const DIFFICULTY_MULT: Record<string, number> = { relaxed: 0.6, balanced: 1.0, intense: 1.5 };
+
 function hexRgb(hex: string): [number, number, number] {
   const c = hex.replace("#", "");
   return [parseInt(c.slice(0, 2), 16), parseInt(c.slice(2, 4), 16), parseInt(c.slice(4, 6), 16)];
 }
-function fmt(n: number) { return n >= 1000 ? `${(n / 1000).toFixed(1)}K` : `${n}`; }
+function fmt(n: number) { return n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(1)}K` : `${Math.floor(n)}`; }
 
-interface GameScreenProps { lobby: Lobby; playerId: string; onLeave: () => void; }
+interface GameScreenProps { lobby: Lobby; playerId: string; onLeave: () => void }
 
 // ─────────────────────────────────────────────────────────────────────────────
 export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
@@ -105,51 +81,66 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
 
   const [players,      setPlayers]      = useState<LobbyPlayer[]>([]);
   const [,             setTick]         = useState(0);
-  const [deployPct,    setDeployPct]    = useState(50);   // % of units deployed to attack front
+  const [attackPct,    setAttackPct]    = useState(20);   // % of balance on border — territorial.io default
   const [placeMode,    setPlaceMode]    = useState<PlaceMode>(null);
   const [bombMode,     setBombMode]     = useState<BombType | null>(null);
   const [buildings,    setBuildings]    = useState<Building[]>([]);
   const [hasSpawned,   setHasSpawned]   = useState(false);
   const [isDead,       setIsDead]       = useState(false);
   const [isSpectating, setIsSpectating] = useState(false);
-  const [unitType,     setUnitType]     = useState<UnitType>("infantry");
-  const [attackTarget, setAttackTarget] = useState<{ name: string } | null>(null);
+  const [attackingPlayer, setAttackingPlayer] = useState<string | null>(null);
 
-  const deployPctRef  = useRef(50);
-  const buildingsRef  = useRef<Building[]>([]);
-  const placeModeRef  = useRef<PlaceMode>(null);
-  const bombModeRef   = useRef<BombType | null>(null);
-  const unitTypeRef   = useRef<UnitType>("infantry");
-  const keysRef       = useRef<Set<string>>(new Set());
+  // Keep refs in sync with state for use inside rAF loops
+  const attackPctRef   = useRef(20);
+  const buildingsRef   = useRef<Building[]>([]);
+  const placeModeRef   = useRef<PlaceMode>(null);
+  const bombModeRef    = useRef<BombType | null>(null);
 
-  useEffect(() => { deployPctRef.current   = deployPct;  }, [deployPct]);
-  useEffect(() => { buildingsRef.current   = buildings;  }, [buildings]);
-  useEffect(() => { placeModeRef.current   = placeMode;  }, [placeMode]);
-  useEffect(() => { bombModeRef.current    = bombMode;   }, [bombMode]);
-  useEffect(() => { unitTypeRef.current    = unitType;   }, [unitType]);
+  useEffect(() => { attackPctRef.current  = attackPct;  }, [attackPct]);
+  useEffect(() => { buildingsRef.current  = buildings;  }, [buildings]);
+  useEffect(() => { placeModeRef.current  = placeMode;  }, [placeMode]);
+  useEffect(() => { bombModeRef.current   = bombMode;   }, [bombMode]);
 
   // ── Grid state ────────────────────────────────────────────────────────────
+  // ownerGrid: which player owns each tile (-1 = unclaimed)
+  // balanceGrid: each tile stores the owner's current balance (for rendering strength)
   const ownerGridRef    = useRef<Int16Array>(new Int16Array(GRID_W * GRID_H).fill(-1));
-  const strengthGridRef = useRef<Float32Array>(new Float32Array(GRID_W * GRID_H).fill(0));
   const landMaskRef     = useRef<Uint8Array | null>(null);
   const coastMaskRef    = useRef<Uint8Array | null>(null);
+
+  // THE KEY DATA STRUCTURE: border tile sets per player
+  // Instead of scanning the full grid, we maintain which tiles are on each player's border
+  // A border tile = owned tile that has at least one non-owned land neighbor
+  const borderTilesRef  = useRef<Map<number, Set<number>>>(new Map()); // ownerIdx → Set<gridIdx>
+
+  // Per-player balance (the single resource — equivalent to territorial.io "balance")
+  const balanceRef      = useRef<Map<number, number>>(new Map()); // ownerIdx → balance
+  // Per-player pixel count (maintained incrementally)
+  const pixelCountRef   = useRef<Map<number, number>>(new Map()); // ownerIdx → pixel count
+
+  // Bot attack targets: which player/direction each bot is attacking
+  const botTargetsRef   = useRef<Map<number, number>>(new Map()); // botOwnerIdx → targetOwnerIdx (-1 = neutral)
+  // Human player attack target
+  const myAttackTargetRef = useRef<number>(-1); // ownerIdx to attack (-1 = neutral/all)
+
   const radZonesRef     = useRef<RadZone[]>([]);
   const shipsRef        = useRef<Ship[]>([]);
-  const myTargetRef     = useRef<AttackTarget | null>(null);
-  const botTargetsRef   = useRef<Map<number, AttackTarget>>(new Map());
   const playersRef      = useRef<Map<string, LobbyPlayer>>(new Map());
   const playerIndexRef  = useRef<Map<string, number>>(new Map());
   const colorsRef       = useRef<[number, number, number][]>([]);
+  const eliminatedRef   = useRef<Set<number>>(new Set());
+  const gameStartRef    = useRef<number>(performance.now());
+  const lastTickRef     = useRef<number>(0);
   const lastSyncRef     = useRef<number>(0);
   const lastBotRef      = useRef<number>(0);
   const channelRef      = useRef<ReturnType<typeof supabase.channel> | null>(null);
-  const eliminatedRef   = useRef<Set<number>>(new Set());
 
   const camRef       = useRef({ x: 0, y: 0, zoom: 1 });
   const dragRef      = useRef({ active: false, startX: 0, startY: 0, camX: 0, camY: 0 });
   const dragMovedRef = useRef(false);
   const mapRectRef   = useRef({ x: 0, y: 0, w: 0, h: 0 });
   const particlesRef = useRef<Particle[]>([]);
+  const keysRef      = useRef<Set<string>>(new Set());
 
   const notify = (msg: string, kind: "info" | "error" | "success" = "info") => {
     if (kind === "error") toast.error(msg);
@@ -157,16 +148,15 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     else toast(msg);
   };
 
+  // ── Helpers ───────────────────────────────────────────────────────────────
   function buildCoastMask(mask: Uint8Array): Uint8Array {
     const coast = new Uint8Array(GRID_W * GRID_H);
     for (let i = 0; i < mask.length; i++) {
       if (!mask[i]) continue;
       const x = i % GRID_W, y = Math.floor(i / GRID_W);
-      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const) {
-        const nx = x + dx, ny = y + dy;
-        if (nx < 0 || ny < 0 || nx >= GRID_W || ny >= GRID_H || !mask[ny * GRID_W + nx]) {
-          coast[i] = 1; break;
-        }
+      for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]] as const) {
+        const nx = x+dx, ny = y+dy;
+        if (nx<0||ny<0||nx>=GRID_W||ny>=GRID_H||!mask[ny*GRID_W+nx]) { coast[i]=1; break; }
       }
     }
     return coast;
@@ -186,7 +176,250 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     return { gx, gy };
   }, []);
 
-  // ── Realtime ──────────────────────────────────────────────────────────────
+  // ── Update border set when a tile changes owner ───────────────────────────
+  // This is called INSTEAD of scanning the whole grid.
+  // O(1) per flip, not O(n) per frame.
+  function updateBorderOnFlip(gridIdx: number, oldOwner: number, newOwner: number) {
+    const mask = landMaskRef.current; if (!mask) return;
+    const grid = ownerGridRef.current;
+    const x = gridIdx % GRID_W, y = Math.floor(gridIdx / GRID_W);
+    const DIRS = [[1,0],[-1,0],[0,1],[0,-1]] as const;
+
+    // Remove from old owner's border set
+    if (oldOwner >= 0) {
+      borderTilesRef.current.get(oldOwner)?.delete(gridIdx);
+    }
+
+    // Add to new owner's border set if it has non-owned land neighbors
+    if (newOwner >= 0) {
+      if (!borderTilesRef.current.has(newOwner)) borderTilesRef.current.set(newOwner, new Set());
+      let isBorder = false;
+      for (const [dx,dy] of DIRS) {
+        const nx=x+dx, ny=y+dy;
+        if (nx<0||ny<0||nx>=GRID_W||ny>=GRID_H) continue;
+        const ni = ny*GRID_W+nx;
+        if (mask[ni] && grid[ni] !== newOwner) { isBorder = true; break; }
+      }
+      if (isBorder) borderTilesRef.current.get(newOwner)!.add(gridIdx);
+    }
+
+    // Re-evaluate all 4 neighbors
+    for (const [dx,dy] of DIRS) {
+      const nx=x+dx, ny=y+dy;
+      if (nx<0||ny<0||nx>=GRID_W||ny>=GRID_H) continue;
+      const ni = ny*GRID_W+nx;
+      if (!mask[ni]) continue;
+      const nOwner = grid[ni];
+      if (nOwner < 0) continue;
+      if (!borderTilesRef.current.has(nOwner)) borderTilesRef.current.set(nOwner, new Set());
+      const bs = borderTilesRef.current.get(nOwner)!;
+      // Check if this neighbor is still a border tile
+      let stillBorder = false;
+      const nnx2 = nx, nny2 = ny;
+      for (const [dx2,dy2] of DIRS) {
+        const nx2=nnx2+dx2, ny2=nny2+dy2;
+        if (nx2<0||ny2<0||nx2>=GRID_W||ny2>=GRID_H) continue;
+        const ni2 = ny2*GRID_W+nx2;
+        if (mask[ni2] && grid[ni2] !== nOwner) { stillBorder = true; break; }
+      }
+      if (stillBorder) bs.add(ni); else bs.delete(ni);
+    }
+  }
+
+  // ── Flip a tile (core operation) ──────────────────────────────────────────
+  // Returns a claim record for broadcasting
+  function flipTile(gridIdx: number, newOwner: number): { i: number; o: number } {
+    const grid = ownerGridRef.current;
+    const oldOwner = grid[gridIdx];
+    grid[gridIdx] = newOwner;
+
+    // Update pixel counts
+    if (oldOwner >= 0) pixelCountRef.current.set(oldOwner, (pixelCountRef.current.get(oldOwner) ?? 1) - 1);
+    if (newOwner >= 0) pixelCountRef.current.set(newOwner, (pixelCountRef.current.get(newOwner) ?? 0) + 1);
+
+    updateBorderOnFlip(gridIdx, oldOwner, newOwner);
+    return { i: gridIdx, o: newOwner };
+  }
+
+  // ── Check elimination ─────────────────────────────────────────────────────
+  function checkElimination(lostOwnerIdx: number, killerIdx: number) {
+    if (eliminatedRef.current.has(lostOwnerIdx)) return;
+    if ((pixelCountRef.current.get(lostOwnerIdx) ?? 0) > 0) return;
+    eliminatedRef.current.add(lostOwnerIdx);
+
+    // Give killer 500 balance bonus
+    const killerBal = balanceRef.current.get(killerIdx) ?? 0;
+    balanceRef.current.set(killerIdx, killerBal + 500);
+
+    const killerEntry = [...playerIndexRef.current.entries()].find(([,v]) => v === killerIdx);
+    if (killerEntry?.[0] === playerId) notify("Enemy eliminated! +500 balance", "success");
+
+    const myIdx = playerIndexRef.current.get(playerId);
+    if (lostOwnerIdx === myIdx) setIsDead(true);
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // THE REAL ENGINE: tickGame()
+  //
+  // Called every TICK_MS (560ms) — same cadence as territorial.io.
+  //
+  // For each player with territory:
+  //   1. Compute interest income based on balance and pixel count
+  //   2. Apply income, clamp to hard cap
+  //   3. Compute attack pressure = balance × attackPct%
+  //   4. Distribute attack pressure across all border tiles
+  //   5. For each border tile: if pressure > neighbor defense → flip
+  //
+  // The magic: because we iterate actual border tiles (not the whole grid),
+  // this is fast. 500 border tiles × 5 players = 2500 checks per tick.
+  // Not 500,000 checks per frame.
+  // ─────────────────────────────────────────────────────────────────────────
+  function tickGame() {
+    const mask = landMaskRef.current; if (!mask) return;
+    const grid = ownerGridRef.current;
+    const blds = buildingsRef.current;
+    const diffMult = DIFFICULTY_MULT[lobby.difficulty] ?? 1;
+    const elapsed = performance.now() - gameStartRef.current;
+
+    const claims: { i: number; o: number }[] = [];
+    const spawnParticles = (gridIdx: number, ownerIdx: number, count: number) => {
+      const col = colorsRef.current[ownerIdx];
+      if (!col) return;
+      const mr = mapRectRef.current, cam = camRef.current;
+      const wx = mr.x + ((gridIdx % GRID_W) + 0.5) / GRID_W * mr.w;
+      const wy = mr.y + (Math.floor(gridIdx / GRID_W) + 0.5) / GRID_H * mr.h;
+      const sx = cam.x + wx * cam.zoom, sy = cam.y + wy * cam.zoom;
+      for (let k = 0; k < count; k++) {
+        particlesRef.current.push({
+          x: sx, y: sy,
+          vx: (Math.random()-0.5)*2, vy: (Math.random()-0.5)*2,
+          life: 1, color: `rgb(${col[0]},${col[1]},${col[2]})`,
+        });
+      }
+    };
+
+    // Interest rate: decays from 7% to 1% over 107s (territorial.io formula)
+    const decayFactor = Math.max(0, 1 - elapsed / INTEREST_DECAY_MS);
+    const baseInterest = INTEREST_FLOOR + (INTEREST_INITIAL - INTEREST_FLOOR) * decayFactor;
+
+    playersRef.current.forEach((player, pid) => {
+      const idx = playerIndexRef.current.get(pid); if (idx === undefined) return;
+      if (!player.alive || eliminatedRef.current.has(idx)) return;
+
+      const pixels = pixelCountRef.current.get(idx) ?? 0;
+      if (pixels === 0 && idx === playerIndexRef.current.get(playerId)) return;
+
+      let balance = balanceRef.current.get(idx) ?? 0;
+      const softCap = pixels * SOFT_CAP_MULT;
+      const hardCap = pixels * HARD_CAP_MULT;
+
+      // ── Interest income (territorial.io compound interest) ──────────────
+      // Interest reduces when above soft cap, hits 0 at hard cap
+      let effectiveInterest = baseInterest * diffMult;
+      if (balance > softCap && softCap > 0) {
+        const capFraction = Math.min(1, (balance - softCap) / (hardCap - softCap));
+        effectiveInterest *= (1 - capFraction);
+      }
+      // Territory income: flat bonus every tick based on pixel count
+      const territoryIncome = Math.sqrt(pixels) * 2 * diffMult;
+
+      // Building bonuses
+      let buildingBonus = 0;
+      blds.forEach(b => {
+        if (b.ownerIdx !== idx) return;
+        if (b.type === "factory") buildingBonus += 8;
+        if (b.type === "city")    buildingBonus += 5;
+        if (b.type === "port")    buildingBonus += 3;
+      });
+
+      balance = Math.min(hardCap, balance * (1 + effectiveInterest) + territoryIncome + buildingBonus);
+      balanceRef.current.set(idx, balance);
+
+      // ── Attack phase ─────────────────────────────────────────────────────
+      const pct = pid === playerId ? attackPctRef.current / 100 : 0.25; // bots use 25%
+      const attackBudget = balance * pct;
+      if (attackBudget < 1) return;
+
+      const borderSet = borderTilesRef.current.get(idx);
+      if (!borderSet || borderSet.size === 0) return;
+
+      // Determine attack target direction for this player
+      const myTarget = pid === playerId ? myAttackTargetRef.current : (botTargetsRef.current.get(idx) ?? -1);
+
+      // Attack pressure per border tile
+      // Split budget across border tiles, weighted toward target direction
+      const borderArr = [...borderSet];
+      const pressurePerTile = attackBudget / Math.max(1, borderArr.length);
+
+      let totalBalanceLost = 0;
+
+      for (const borderIdx of borderArr) {
+        const bx = borderIdx % GRID_W, by = Math.floor(borderIdx / GRID_W);
+        const DIRS = [[1,0],[-1,0],[0,1],[0,-1]] as const;
+
+        for (const [dx,dy] of DIRS) {
+          const nx=bx+dx, ny=by+dy;
+          if (nx<0||ny<0||nx>=GRID_W||ny>=GRID_H) continue;
+          const ni = ny*GRID_W+nx;
+          if (!mask[ni] || grid[ni] === idx) continue;
+
+          const neighborOwner = grid[ni];
+
+          // If we have a specific target, skip tiles that don't touch it (unless neutral)
+          if (myTarget >= 0 && neighborOwner !== myTarget && neighborOwner !== -1) continue;
+
+          // Defense value: base = defender's balance / their border length
+          // (simulates "defense is spread over border" just like attack is)
+          let defenseVal = 0;
+          if (neighborOwner >= 0) {
+            const defBalance = balanceRef.current.get(neighborOwner) ?? 0;
+            const defBorder = borderTilesRef.current.get(neighborOwner)?.size ?? 1;
+            defenseVal = (defBalance / Math.max(1, defBorder)) * DEFENSE_MULT;
+          }
+
+          // Building defense bonuses
+          const hasFort    = blds.some(b => b.gridIdx === ni && b.type === "fort");
+          const hasDefPost = blds.some(b => b.gridIdx === ni && b.type === "defense_post");
+          if (hasFort)    defenseVal *= FORT_DEFENSE_BONUS;
+          if (hasDefPost) defenseVal *= DEFPOST_BONUS;
+
+          if (pressurePerTile > defenseVal) {
+            // WIN — flip the tile
+            const excess = pressurePerTile - defenseVal;
+            claims.push(flipTile(ni, idx));
+            spawnParticles(ni, idx, neighborOwner >= 0 ? 3 : 1);
+
+            // Cost: attacker loses the defense value from their balance
+            totalBalanceLost += Math.max(1, defenseVal * 0.5);
+
+            // Defender loses some balance too
+            if (neighborOwner >= 0) {
+              const defBal = balanceRef.current.get(neighborOwner) ?? 0;
+              balanceRef.current.set(neighborOwner, Math.max(0, defBal - excess * 0.3));
+            }
+
+            // Update building ownership
+            blds.forEach(b => { if (b.gridIdx === ni) b.ownerIdx = idx; });
+
+            checkElimination(neighborOwner, idx);
+            break; // one flip per border tile per tick (territorial.io style)
+          }
+        }
+      }
+
+      // Deduct attack cost from attacker
+      balanceRef.current.set(idx, Math.max(0, balance - totalBalanceLost));
+    });
+
+    // Broadcast flips
+    if (claims.length > 0) {
+      for (let ci = 0; ci < claims.length; ci += 80) {
+        channelRef.current?.send({ type: "broadcast", event: "claim", payload: claims.slice(ci, ci+80) });
+      }
+    }
+  }
+
+  // ── Realtime setup ────────────────────────────────────────────────────────
   useEffect(() => {
     let active = true;
     async function load() {
@@ -197,8 +430,14 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
       data.forEach(p => map.set(p.player_id, p));
       playersRef.current = map;
       const idx = new Map<string, number>();
-      const cols: [number, number, number][] = [];
-      data.forEach((p, i) => { idx.set(p.player_id, i); cols.push(hexRgb(p.color)); });
+      const cols: [number,number,number][] = [];
+      data.forEach((p, i) => {
+        idx.set(p.player_id, i);
+        cols.push(hexRgb(p.color));
+        balanceRef.current.set(i, p.units || 100);
+        pixelCountRef.current.set(i, 0);
+        borderTilesRef.current.set(i, new Set());
+      });
       playerIndexRef.current = idx;
       colorsRef.current = cols;
     }
@@ -206,17 +445,22 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
 
     const ch = supabase
       .channel(`game-${lobby.id}`, { config: { broadcast: { self: false } } })
-      .on("postgres_changes", { event: "*", schema: "public", table: "lobby_players", filter: `lobby_id=eq.${lobby.id}` },
-        payload => {
-          if (payload.eventType === "DELETE") return;
-          const p = payload.new as LobbyPlayer;
-          playersRef.current.set(p.player_id, p);
-          setPlayers(prev => { const i = prev.findIndex(x => x.player_id === p.player_id); if (i === -1) return [...prev, p]; const n = [...prev]; n[i] = p; return n; });
-        })
+      .on("postgres_changes", { event: "*", schema: "public", table: "lobby_players", filter: `lobby_id=eq.${lobby.id}` }, payload => {
+        if (payload.eventType === "DELETE") return;
+        const p = payload.new as LobbyPlayer;
+        playersRef.current.set(p.player_id, p);
+        setPlayers(prev => { const i = prev.findIndex(x => x.player_id === p.player_id); if (i === -1) return [...prev, p]; const n = [...prev]; n[i] = p; return n; });
+      })
       .on("broadcast", { event: "claim" }, ({ payload }) => {
-        const claims = payload as { i: number; o: number; s: number }[];
-        const grid = ownerGridRef.current, str = strengthGridRef.current;
-        for (const c of claims) { grid[c.i] = c.o; str[c.i] = c.s ?? 0; }
+        const claimsIn = payload as { i: number; o: number }[];
+        const grid = ownerGridRef.current;
+        for (const c of claimsIn) {
+          const old = grid[c.i];
+          grid[c.i] = c.o;
+          if (old >= 0) pixelCountRef.current.set(old, Math.max(0, (pixelCountRef.current.get(old)??0)-1));
+          if (c.o >= 0) pixelCountRef.current.set(c.o, (pixelCountRef.current.get(c.o)??0)+1);
+          updateBorderOnFlip(c.i, old, c.o);
+        }
       })
       .on("broadcast", { event: "building" }, ({ payload }) => {
         const b = payload as Building;
@@ -225,9 +469,13 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
           setBuildings(prev => [...prev, b]);
         }
       })
-      .on("broadcast", { event: "target" }, ({ payload }) => {
-        const t = payload as AttackTarget;
-        botTargetsRef.current.set(t.ownerIdx, t);
+      .on("broadcast", { event: "bot_target" }, ({ payload }) => {
+        const { ownerIdx, targetIdx } = payload as { ownerIdx: number; targetIdx: number };
+        botTargetsRef.current.set(ownerIdx, targetIdx);
+      })
+      .on("broadcast", { event: "balance" }, ({ payload }) => {
+        const { idx: oi, balance } = payload as { idx: number; balance: number };
+        balanceRef.current.set(oi, balance);
       })
       .on("broadcast", { event: "rad_zone" }, ({ payload }) => {
         radZonesRef.current = [...radZonesRef.current, ...(payload as RadZone[])];
@@ -245,203 +493,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     loadLandMask().then(m => { landMaskRef.current = m; coastMaskRef.current = buildCoastMask(m); });
   }, []);
 
-  // ─── Core pressure simulation — OpenFront/Territorial style ──────────────
-  //
-  // How it works:
-  //   • NO passive spreading. Borders don't move unless you have an attack target.
-  //   • When attacking: your deployed units (units × deployPct%) push your border
-  //     toward the target tile like acid eating through territory.
-  //   • Each tile flip COSTS real units from the attacker. Stronger defenses cost more.
-  //   • The defender also loses units when they lose a tile.
-  //   • Deploy% controls how aggressively you push — higher = faster attack but you
-  //     burn through units quicker, leaving less to defend with.
-  //
-  function tickPressure(dt: number) {
-    const mask = landMaskRef.current; if (!mask) return;
-    const grid = ownerGridRef.current;
-    const str  = strengthGridRef.current;
-    const blds = buildingsRef.current;
-    const myTarget   = myTargetRef.current;
-    const botTargets = botTargetsRef.current;
-
-    // Strength regen on owned tiles (slower than before — sustained pressure matters)
-    const regenMult = DIFFICULTY_REGEN[lobby.difficulty] ?? 1;
-    for (let i = 0; i < grid.length; i++) {
-      if (grid[i] < 0) continue;
-      str[i] = Math.min(MAX_STRENGTH, str[i] + REGEN_RATE * regenMult * dt * 0.04);
-    }
-
-    const claims: { i: number; o: number; s: number }[] = [];
-    const mr  = mapRectRef.current;
-    const cam = camRef.current;
-
-    // Helper: spawn attack particles
-    const spawnParticles = (ni: number, o: number, count: number) => {
-      const col = colorsRef.current[o] ? `rgb(${colorsRef.current[o].join(",")})` : "#fff";
-      const wx  = mr.x + ((ni % GRID_W) + 0.5) / GRID_W * mr.w;
-      const wy  = mr.y + (Math.floor(ni / GRID_W) + 0.5) / GRID_H * mr.h;
-      for (let k = 0; k < count; k++) {
-        particlesRef.current.push({
-          x: cam.x + wx * cam.zoom, y: cam.y + wy * cam.zoom,
-          vx: (Math.random() - 0.5) * 1.5, vy: (Math.random() - 0.5) * 1.5,
-          life: 1, color: col,
-        });
-      }
-    };
-
-    // Helper: check if an owner just got eliminated
-    const checkElimination = (lostOwnerIdx: number, killerOwnerIdx: number) => {
-      if (eliminatedRef.current.has(lostOwnerIdx)) return;
-      let survived = false;
-      for (let k = 0; k < grid.length; k++) if (grid[k] === lostOwnerIdx) { survived = true; break; }
-      if (!survived) {
-        eliminatedRef.current.add(lostOwnerIdx);
-        const killerEntry = [...playerIndexRef.current.entries()].find(([, v]) => v === killerOwnerIdx);
-        if (killerEntry) {
-          const killer = playersRef.current.get(killerEntry[0]);
-          if (killer) {
-            killer.coins = (killer.coins || 0) + 500;
-            supabase.from("lobby_players").update({ coins: killer.coins }).eq("lobby_id", lobby.id).eq("player_id", killerEntry[0]);
-            if (killerEntry[0] === playerId) notify("Enemy eliminated! +500 coins", "success");
-          }
-        }
-        const myIdx = playerIndexRef.current.get(playerId);
-        if (lostOwnerIdx === myIdx) setIsDead(true);
-      }
-    };
-
-    // Build a list of all active attacks this tick
-    type ActiveAttack = { target: AttackTarget; player: LobbyPlayer; pid: string; deployFrac: number };
-    const activeAttacks: ActiveAttack[] = [];
-
-    if (myTarget) {
-      const player = playersRef.current.get(playerId);
-      if (player && player.alive) {
-        activeAttacks.push({ target: myTarget, player, pid: playerId, deployFrac: deployPctRef.current / 100 });
-      }
-    }
-    botTargets.forEach((t, ownerIdx) => {
-      const entry = [...playerIndexRef.current.entries()].find(([, v]) => v === ownerIdx);
-      if (!entry) return;
-      const player = playersRef.current.get(entry[0]);
-      if (player && player.alive) activeAttacks.push({ target: t, player, pid: entry[0], deployFrac: 0.55 });
-    });
-
-    // For each active attack: iterate the grid and push the front
-    for (const { target, player, deployFrac } of activeAttacks) {
-      const o = target.ownerIdx;
-      if (player.units < 1) continue;
-
-      const deployedUnits = player.units * deployFrac;
-      // Attack rate: probability per border tile per tick
-      // At UNIT_SCALE_BASE deployed units: base rate × uMult
-      // This means at 500 deployed infantry, each border tile near the target
-      // has ATTACK_SPREAD_BASE chance to flip per 16ms (~1-2 tiles/sec total)
-      const uMult = UNIT_MULT[target.unitType];
-      const unitScale = Math.max(0.05, deployedUnits / UNIT_SCALE_BASE);
-      const flipChance = ATTACK_SPREAD_BASE * unitScale * uMult * (dt / 16.67);
-
-      const tx = target.targetIdx % GRID_W;
-      const ty = Math.floor(target.targetIdx / GRID_W);
-
-      for (let i = 0; i < grid.length; i++) {
-        if (grid[i] !== o) continue;
-        if (str[i] < 0.5) continue;
-        if (player.units < 1) break; // ran out of troops, stop attacking
-
-        const x = i % GRID_W, y = Math.floor(i / GRID_W);
-
-        // Only process tiles that are on the border (have a non-owned neighbor that's land)
-        // AND are within striking distance of the target direction
-        // Collect candidate enemy/neutral neighbors
-        const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]] as const;
-        const candidates: { ni: number; score: number }[] = [];
-        for (const [dx, dy] of dirs) {
-          const nx = x + dx, ny = y + dy;
-          if (nx < 0 || ny < 0 || nx >= GRID_W || ny >= GRID_H) continue;
-          const ni = ny * GRID_W + nx;
-          if (!mask[ni] || grid[ni] === o) continue;
-          // Score: how much closer does this get us to the target?
-          const curDist  = Math.abs(x - tx) + Math.abs(y - ty);
-          const nextDist = Math.abs(nx - tx) + Math.abs(ny - ty);
-          // Heavily favor directions toward target (6× weight for tiles that close distance)
-          const score = nextDist < curDist ? 1 : nextDist === curDist ? 4 : 12;
-          candidates.push({ ni, score });
-        }
-        if (candidates.length === 0) continue;
-
-        // Roll flip chance — weighted toward target direction
-        // We pick ONE candidate per border tile per tick at most
-        const totalWeight = candidates.reduce((s, c) => s + 1 / c.score, 0);
-        const r = Math.random();
-        if (r > flipChance) continue; // didn't trigger this tick
-
-        // Pick candidate weighted by score (lower score = higher weight)
-        let pick = candidates[0].ni;
-        {
-          let acc = 0;
-          const pickRoll = Math.random() * totalWeight;
-          for (const c of candidates) {
-            acc += 1 / c.score;
-            if (pickRoll <= acc) { pick = c.ni; break; }
-          }
-        }
-
-        const ni = pick;
-        const no = grid[ni];
-
-        const hasFort    = blds.some(b => b.gridIdx === ni && b.type === "fort");
-        const hasDefPost = blds.some(b => b.gridIdx === ni && b.type === "defense_post");
-        const defMult    = hasFort ? FORT_DEFENSE : hasDefPost ? DEFPOST_MULT : 1.0;
-
-        if (no < 0) {
-          // ── Neutral tile: always claim, small unit cost ────────────────
-          grid[ni] = o;
-          str[ni]  = Math.min(MAX_STRENGTH, str[i] * 0.5 + 5);
-          claims.push({ i: ni, o, s: str[ni] });
-          player.units = Math.max(0, player.units - FLIP_COST_NEUTRAL);
-          spawnParticles(ni, o, 1);
-
-        } else {
-          // ── Enemy tile: fight based on strength + defMult ─────────────
-          const atkStr = str[i] * uMult;
-          const defStr = str[ni] * defMult;
-
-          if (atkStr > defStr) {
-            // Win: flip the tile
-            grid[ni] = o;
-            str[ni]  = Math.max(1, (atkStr - defStr) * 0.4);
-            // Attacker pays cost proportional to defender strength
-            const atkCost = Math.max(FLIP_COST_ENEMY_BASE, Math.round(FLIP_COST_ENEMY_BASE * defMult));
-            player.units = Math.max(0, player.units - atkCost);
-            // Defender also loses units
-            const defEntry = [...playerIndexRef.current.entries()].find(([, v]) => v === no);
-            if (defEntry) {
-              const defPlayer = playersRef.current.get(defEntry[0]);
-              if (defPlayer) defPlayer.units = Math.max(0, defPlayer.units - FLIP_COST_DEFENDER);
-            }
-            claims.push({ i: ni, o, s: str[ni] });
-            spawnParticles(ni, o, 3);
-            checkElimination(no, o);
-            blds.forEach(b => { if (b.gridIdx === ni && o >= 0) b.ownerIdx = o; });
-
-          } else {
-            // Lose: attacker tile loses some strength, attacker pays a smaller unit cost
-            str[i] = Math.max(0, str[i] - defStr * 0.08);
-            player.units = Math.max(0, player.units - Math.ceil(FLIP_COST_ENEMY_BASE * 0.4));
-          }
-        }
-      }
-    }
-
-    if (claims.length > 0) {
-      for (let ci = 0; ci < claims.length; ci += 60) {
-        channelRef.current?.send({ type: "broadcast", event: "claim", payload: claims.slice(ci, ci + 60) });
-      }
-    }
-  }
-
-  // ─── Render + sim loop ────────────────────────────────────────────────────
+  // ─── Render + main loop ───────────────────────────────────────────────────
   useEffect(() => {
     const canvas = canvasRef.current, container = containerRef.current;
     if (!canvas || !container) return;
@@ -457,11 +509,11 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
 
     function computeMapRect() {
       const w = canvas!.width, h = canvas!.height;
-      const ratio = 1920 / 960, cr = w / h;
+      const ratio = 1920/960, cr = w/h;
       let mw, mh, mx, my: number;
-      if (cr > ratio) { mh = h; mw = h * ratio; mx = (w - mw) / 2; my = 0; }
-      else { mw = w; mh = w / ratio; mx = 0; my = (h - mh) / 2; }
-      return { x: mx, y: my, w: mw, h: mh };
+      if (cr > ratio) { mh=h; mw=h*ratio; mx=(w-mw)/2; my=0; }
+      else { mw=w; mh=w/ratio; mx=0; my=(h-mh)/2; }
+      return { x:mx, y:my, w:mw, h:mh };
     }
     function resize() {
       const r = container!.getBoundingClientRect();
@@ -472,36 +524,18 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     resize();
     const ro = new ResizeObserver(resize); ro.observe(container);
 
-    // ── Sync to DB ────────────────────────────────────────────────────────
+    // ── DB sync ───────────────────────────────────────────────────────────
     async function syncStats() {
       if (lobby.host_id !== playerId) return;
-      const grid = ownerGridRef.current, blds = buildingsRef.current;
-      blds.forEach(b => { const cur = grid[b.gridIdx]; if (cur >= 0 && cur !== b.ownerIdx) b.ownerIdx = cur; });
-
-      const pixelCounts  = new Array(colorsRef.current.length).fill(0);
-      const unitBonus    = new Array(colorsRef.current.length).fill(0);
-      const coinBonus    = new Array(colorsRef.current.length).fill(0);
-      const popCapBonus  = new Array(colorsRef.current.length).fill(0);
-      for (let i = 0; i < grid.length; i++) { const o = grid[i]; if (o >= 0) pixelCounts[o]++; }
-      blds.forEach(b => {
-        const o = b.ownerIdx;
-        if (b.type === "factory") unitBonus[o] = (unitBonus[o] || 0) + FACTORY_UNITS;
-        if (b.type === "port")    coinBonus[o] = (coinBonus[o] || 0) + PORT_COINS;
-        if (b.type === "city") { coinBonus[o] = (coinBonus[o] || 0) + CITY_COINS; popCapBonus[o] = (popCapBonus[o] || 0) + CITY_POP_CAP; }
-      });
-
-      const regenMult = DIFFICULTY_REGEN[lobby.difficulty] ?? 1;
       const updates: Promise<unknown>[] = [];
-      playersRef.current.forEach(p => {
-        const idx = playerIndexRef.current.get(p.player_id); if (idx === undefined) return;
-        const px = pixelCounts[idx] ?? 0;
-        if (!p.alive && p.is_bot) { if (!eliminatedRef.current.has(idx)) eliminatedRef.current.add(idx); return; }
-        const passive  = Math.round(Math.sqrt(px) * 2 * regenMult);
-        const newUnits = Math.min(9999 + (popCapBonus[idx] || 0), p.units + passive + (unitBonus[idx] || 0));
-        const newCoins = Math.min(99999, (p.coins || 0) + (coinBonus[idx] || 0));
-        const alive    = px > 0 || p.units > 0;
-        p.units = newUnits; p.coins = newCoins;
-        updates.push(supabase.from("lobby_players").update({ pixels: px, units: newUnits, coins: newCoins, alive }).eq("lobby_id", lobby.id).eq("player_id", p.player_id));
+      playersRef.current.forEach((p, pid) => {
+        const idx = playerIndexRef.current.get(pid); if (idx === undefined) return;
+        if (!p.alive) return;
+        const px = pixelCountRef.current.get(idx) ?? 0;
+        const bal = Math.floor(balanceRef.current.get(idx) ?? 0);
+        const alive = px > 0 || bal > 0;
+        p.units = bal; p.pixels = px;
+        updates.push(supabase.from("lobby_players").update({ pixels: px, units: bal, alive }).eq("lobby_id", lobby.id).eq("player_id", pid));
       });
       await Promise.all(updates);
     }
@@ -509,37 +543,37 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     // ── Draw building icon ────────────────────────────────────────────────
     function drawBldIcon(px: number, py: number, type: BuildingType, color: string, zoom: number) {
       ctx.save();
-      const r = Math.max(3, Math.min(8, 5 * zoom));
+      const r = Math.max(3, Math.min(9, 6 * zoom));
       ctx.fillStyle = color; ctx.strokeStyle = "rgba(0,0,0,0.9)"; ctx.lineWidth = 1;
       switch (type) {
         case "city":
-          ctx.fillRect(px - r, py - r * 0.6, r * 2, r * 1.4); ctx.strokeRect(px - r, py - r * 0.6, r * 2, r * 1.4);
-          ctx.fillRect(px - r, py - r * 1.5, r * 0.7, r * 0.9); ctx.strokeRect(px - r, py - r * 1.5, r * 0.7, r * 0.9);
-          ctx.fillRect(px + r * 0.3, py - r * 1.8, r * 0.7, r * 1.2); ctx.strokeRect(px + r * 0.3, py - r * 1.8, r * 0.7, r * 1.2);
-          break;
+          ctx.fillRect(px-r,py-r*0.6,r*2,r*1.4); ctx.strokeRect(px-r,py-r*0.6,r*2,r*1.4);
+          ctx.fillRect(px-r,py-r*1.5,r*0.7,r*0.9); ctx.strokeRect(px-r,py-r*1.5,r*0.7,r*0.9);
+          ctx.fillRect(px+r*0.3,py-r*1.8,r*0.7,r*1.2); ctx.strokeRect(px+r*0.3,py-r*1.8,r*0.7,r*1.2); break;
         case "defense_post":
-          ctx.beginPath(); ctx.moveTo(px, py - r * 1.4); ctx.lineTo(px + r, py - r * 0.4); ctx.lineTo(px + r, py + r * 0.6);
-          ctx.lineTo(px, py + r * 1.4); ctx.lineTo(px - r, py + r * 0.6); ctx.lineTo(px - r, py - r * 0.4);
+          ctx.beginPath(); ctx.moveTo(px,py-r*1.4); ctx.lineTo(px+r,py-r*0.4); ctx.lineTo(px+r,py+r*0.6);
+          ctx.lineTo(px,py+r*1.4); ctx.lineTo(px-r,py+r*0.6); ctx.lineTo(px-r,py-r*0.4);
           ctx.closePath(); ctx.fill(); ctx.stroke(); break;
         case "port":
-          ctx.beginPath(); ctx.arc(px, py - r * 0.6, r * 0.55, 0, Math.PI * 2); ctx.stroke();
-          ctx.beginPath(); ctx.moveTo(px, py - r * 0.6); ctx.lineTo(px, py + r); ctx.moveTo(px - r * 0.8, py + r * 0.6); ctx.lineTo(px + r * 0.8, py + r * 0.6); ctx.stroke(); break;
+          ctx.beginPath(); ctx.arc(px,py-r*0.6,r*0.55,0,Math.PI*2); ctx.stroke();
+          ctx.beginPath(); ctx.moveTo(px,py-r*0.6); ctx.lineTo(px,py+r);
+          ctx.moveTo(px-r*0.8,py+r*0.6); ctx.lineTo(px+r*0.8,py+r*0.6); ctx.stroke(); break;
         case "fort":
           ctx.beginPath();
-          for (let a = 0; a < 6; a++) { const ang = (a / 6) * Math.PI * 2 - Math.PI / 6; a === 0 ? ctx.moveTo(px + Math.cos(ang) * r, py + Math.sin(ang) * r) : ctx.lineTo(px + Math.cos(ang) * r, py + Math.sin(ang) * r); }
+          for (let a=0;a<6;a++) { const ang=(a/6)*Math.PI*2-Math.PI/6; a===0?ctx.moveTo(px+Math.cos(ang)*r,py+Math.sin(ang)*r):ctx.lineTo(px+Math.cos(ang)*r,py+Math.sin(ang)*r); }
           ctx.closePath(); ctx.fill(); ctx.stroke(); break;
         case "factory":
-          ctx.fillRect(px - r, py - r * 0.6, r * 2, r * 1.4); ctx.strokeRect(px - r, py - r * 0.6, r * 2, r * 1.4);
-          ctx.fillRect(px - r * 0.5, py - r * 1.5, r * 0.55, r); ctx.strokeRect(px - r * 0.5, py - r * 1.5, r * 0.55, r); break;
+          ctx.fillRect(px-r,py-r*0.6,r*2,r*1.4); ctx.strokeRect(px-r,py-r*0.6,r*2,r*1.4);
+          ctx.fillRect(px-r*0.5,py-r*1.5,r*0.55,r); ctx.strokeRect(px-r*0.5,py-r*1.5,r*0.55,r); break;
         case "missile_silo":
-          ctx.beginPath(); ctx.moveTo(px, py - r * 1.5); ctx.lineTo(px + r * 0.75, py + r); ctx.lineTo(px - r * 0.75, py + r); ctx.closePath(); ctx.fill(); ctx.stroke();
-          ctx.fillStyle = "#f97316"; ctx.beginPath(); ctx.moveTo(px - r * 0.4, py + r); ctx.lineTo(px, py + r * 1.9); ctx.lineTo(px + r * 0.4, py + r); ctx.closePath(); ctx.fill(); break;
+          ctx.beginPath(); ctx.moveTo(px,py-r*1.5); ctx.lineTo(px+r*0.75,py+r); ctx.lineTo(px-r*0.75,py+r); ctx.closePath(); ctx.fill(); ctx.stroke();
+          ctx.fillStyle="#f97316"; ctx.beginPath(); ctx.moveTo(px-r*0.4,py+r); ctx.lineTo(px,py+r*1.9); ctx.lineTo(px+r*0.4,py+r); ctx.closePath(); ctx.fill(); break;
         case "sam_launcher":
-          ctx.beginPath(); ctx.arc(px, py, r, Math.PI, Math.PI * 2); ctx.fill(); ctx.stroke();
-          ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(px, py + r); ctx.stroke(); break;
+          ctx.beginPath(); ctx.arc(px,py,r,Math.PI,Math.PI*2); ctx.fill(); ctx.stroke();
+          ctx.beginPath(); ctx.moveTo(px,py); ctx.lineTo(px,py+r); ctx.stroke(); break;
         case "naval_base":
-          ctx.beginPath(); ctx.moveTo(px - r, py + r * 0.3); ctx.lineTo(px + r, py + r * 0.3); ctx.lineTo(px + r * 0.7, py - r * 0.3); ctx.lineTo(px - r * 0.7, py - r * 0.3); ctx.closePath(); ctx.fill(); ctx.stroke();
-          ctx.fillRect(px - r * 0.15, py - r, r * 0.3, r * 0.7); break;
+          ctx.beginPath(); ctx.moveTo(px-r,py+r*0.3); ctx.lineTo(px+r,py+r*0.3); ctx.lineTo(px+r*0.7,py-r*0.3); ctx.lineTo(px-r*0.7,py-r*0.3); ctx.closePath(); ctx.fill(); ctx.stroke();
+          ctx.fillRect(px-r*0.15,py-r,r*0.3,r*0.7); break;
       }
       ctx.restore();
     }
@@ -547,142 +581,155 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     // ── Render ────────────────────────────────────────────────────────────
     function render() {
       const w = canvas!.width, h = canvas!.height;
-      ctx.clearRect(0, 0, w, h);
-      ctx.fillStyle = "#0a1628"; ctx.fillRect(0, 0, w, h);
+      ctx.clearRect(0,0,w,h);
+      ctx.fillStyle="#0a1628"; ctx.fillRect(0,0,w,h);
       const mr = computeMapRect(); mapRectRef.current = mr;
-      const { x: mx, y: my, w: mw, h: mh } = mr;
-      const cellW = mw / GRID_W, cellH = mh / GRID_H;
+      const { x:mx, y:my, w:mw, h:mh } = mr;
+      const cellW = mw/GRID_W, cellH = mh/GRID_H;
       const cam = camRef.current;
 
       ctx.save();
       ctx.translate(cam.x, cam.y); ctx.scale(cam.zoom, cam.zoom);
 
-      if (bgImg.complete) ctx.drawImage(bgImg, mx, my, mw, mh);
-      else { ctx.fillStyle = "#1a3050"; ctx.fillRect(mx, my, mw, mh); }
+      if (bgImg.complete) ctx.drawImage(bgImg,mx,my,mw,mh);
+      else { ctx.fillStyle="#1a3050"; ctx.fillRect(mx,my,mw,mh); }
 
-      // Territory
-      const grid   = ownerGridRef.current;
-      const str    = strengthGridRef.current;
+      const grid = ownerGridRef.current;
       const colors = colorsRef.current;
-      const data   = imgData.data;
-      const defPostSet = new Set(buildingsRef.current.filter(b => b.type === "defense_post").map(b => b.gridIdx));
-      const radMap = new Map<number, number>(); radZonesRef.current.forEach(rz => radMap.set(rz.gridIdx, rz.strength));
+      const data = imgData.data;
+      const radMap = new Map<number,number>();
+      radZonesRef.current.forEach(rz => radMap.set(rz.gridIdx, rz.strength));
+
+      // Build per-player balance-relative strength for rendering
+      // Tiles render brighter when balance is higher relative to cap
+      const strengthByOwner = new Map<number,number>();
+      balanceRef.current.forEach((bal, idx) => {
+        const px = pixelCountRef.current.get(idx) ?? 1;
+        const softCap = Math.max(1, px * SOFT_CAP_MULT);
+        strengthByOwner.set(idx, Math.min(1, bal / softCap));
+      });
 
       for (let i = 0; i < grid.length; i++) {
         if (radMap.has(i)) {
           const s = radMap.get(i)!;
-          data[i * 4] = 20; data[i * 4 + 1] = 220; data[i * 4 + 2] = 60;
-          data[i * 4 + 3] = Math.min(200, 100 + s * 0.6); continue;
+          data[i*4]=20; data[i*4+1]=220; data[i*4+2]=60; data[i*4+3]=Math.min(200,100+s*0.6); continue;
         }
         const o = grid[i];
-        if (o < 0 || !colors[o]) { data[i * 4 + 3] = 0; continue; }
+        if (o < 0 || !colors[o]) { data[i*4+3]=0; continue; }
         const c = colors[o];
-        const x = i % GRID_W, y = Math.floor(i / GRID_W);
-        const checker = defPostSet.has(i) && (x + y) % 2 === 0;
-        const alpha = 120 + (str[i] / MAX_STRENGTH) * 90;
-        data[i * 4]     = checker ? Math.min(255, c[0] + 70) : c[0];
-        data[i * 4 + 1] = checker ? Math.min(255, c[1] + 70) : c[1];
-        data[i * 4 + 2] = checker ? Math.min(255, c[2] + 70) : c[2];
-        data[i * 4 + 3] = alpha;
+        const strength = strengthByOwner.get(o) ?? 0.5;
+        // Alpha: 100 (weak) → 210 (at peak income) — gives visual feedback on balance
+        data[i*4]   = c[0]; data[i*4+1] = c[1]; data[i*4+2] = c[2];
+        data[i*4+3] = Math.floor(100 + strength * 110);
       }
-      offCtx.putImageData(imgData, 0, 0);
-      ctx.imageSmoothingEnabled = false; ctx.drawImage(off, mx, my, mw, mh); ctx.imageSmoothingEnabled = true;
+      offCtx.putImageData(imgData,0,0);
+      ctx.imageSmoothingEnabled=false; ctx.drawImage(off,mx,my,mw,mh); ctx.imageSmoothingEnabled=true;
 
-      // Border outlines
-      for (let i = 0; i < grid.length; i++) {
-        const o = grid[i]; if (o < 0) continue;
-        const x = i % GRID_W, y = Math.floor(i / GRID_W);
-        let isBorder = x === 0 || y === 0 || x === GRID_W - 1 || y === GRID_H - 1;
-        if (!isBorder) isBorder = grid[i + 1] !== o || grid[i - 1] !== o || grid[i + GRID_W] !== o || grid[i - GRID_W] !== o;
-        if (!isBorder) continue;
-        const c = colors[o];
-        ctx.strokeStyle = `rgba(${Math.min(255, c[0] + 90)},${Math.min(255, c[1] + 90)},${Math.min(255, c[2] + 90)},0.95)`;
-        ctx.lineWidth = Math.max(0.6, cellW * 0.35);
-        ctx.strokeRect(mx + x * cellW + 0.5, my + y * cellH + 0.5, cellW - 1, cellH - 1);
-      }
+      // Border outlines — only draw actual border tiles (from our border set)
+      borderTilesRef.current.forEach((bs, ownerIdx) => {
+        if (!colors[ownerIdx]) return;
+        const c = colors[ownerIdx];
+        ctx.strokeStyle = `rgba(${Math.min(255,c[0]+100)},${Math.min(255,c[1]+100)},${Math.min(255,c[2]+100)},0.9)`;
+        ctx.lineWidth = Math.max(0.5, cellW * 0.3);
+        for (const gi of bs) {
+          const bx = gi % GRID_W, by = Math.floor(gi / GRID_W);
+          ctx.strokeRect(mx+bx*cellW+0.5, my+by*cellH+0.5, cellW-1, cellH-1);
+        }
+      });
 
       // Attack target crosshair
-      const myTarget = myTargetRef.current;
-      if (myTarget) {
-        const ptx = mx + (myTarget.targetIdx % GRID_W + 0.5) * cellW;
-        const pty = my + (Math.floor(myTarget.targetIdx / GRID_W) + 0.5) * cellH;
-        const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 200);
+      const myTarget = myAttackTargetRef.current;
+      if (myTarget >= 0) {
+        // Draw highlight on all tiles belonging to target
         ctx.save();
-        ctx.strokeStyle = `rgba(255,255,100,${0.6 + pulse * 0.4})`;
-        ctx.lineWidth = 1.5;
-        ctx.beginPath();
-        ctx.moveTo(ptx - cellW * 2, pty); ctx.lineTo(ptx + cellW * 2, pty);
-        ctx.moveTo(ptx, pty - cellH * 2); ctx.lineTo(ptx, pty + cellH * 2);
-        ctx.stroke();
+        const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 200);
+        ctx.strokeStyle = `rgba(255,255,80,${0.5 + pulse * 0.5})`;
+        ctx.lineWidth = 1.2;
+        for (let i = 0; i < grid.length; i++) {
+          if (grid[i] !== myTarget) continue;
+          const bx = i % GRID_W, by = Math.floor(i / GRID_W);
+          // Only draw on border tiles for perf
+          const borderSet = borderTilesRef.current.get(myTarget);
+          if (!borderSet?.has(i)) continue;
+          ctx.strokeRect(mx+bx*cellW, my+by*cellH, cellW, cellH);
+        }
         ctx.restore();
       }
 
       // Buildings
       buildingsRef.current.forEach(b => {
         const curOwner = grid[b.gridIdx];
-        const entry = [...playerIndexRef.current.entries()].find(([, v]) => v === curOwner);
+        const entry = [...playerIndexRef.current.entries()].find(([,v]) => v === curOwner);
         const col = entry ? playersRef.current.get(entry[0])?.color ?? "#fff" : "#fff";
-        drawBldIcon(mx + (b.gridIdx % GRID_W) / GRID_W * mw + cellW / 2, my + Math.floor(b.gridIdx / GRID_W) / GRID_H * mh + cellH / 2, b.type, col, cam.zoom);
+        drawBldIcon(mx+(b.gridIdx%GRID_W)/GRID_W*mw+cellW/2, my+Math.floor(b.gridIdx/GRID_W)/GRID_H*mh+cellH/2, b.type, col, cam.zoom);
       });
 
       // Ships
       shipsRef.current.forEach(ship => {
         const sx = ship.fromX + (ship.toX - ship.fromX) * ship.progress;
         const sy = ship.fromY + (ship.toY - ship.fromY) * ship.progress;
-        const entry = [...playerIndexRef.current.entries()].find(([, v]) => v === ship.ownerIdx);
+        const entry = [...playerIndexRef.current.entries()].find(([,v]) => v === ship.ownerIdx);
         const col = entry ? playersRef.current.get(entry[0])?.color ?? "#4af" : "#4af";
         const angle = Math.atan2(ship.toY - ship.fromY, ship.toX - ship.fromX);
         ctx.save();
-        ctx.translate(sx, sy); ctx.rotate(angle);
-        ctx.fillStyle = col; ctx.strokeStyle = "rgba(255,255,255,0.8)"; ctx.lineWidth = 0.8;
-        ctx.beginPath(); ctx.ellipse(0, 0, 7, 3.5, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
-        ctx.globalAlpha = 0.25; ctx.strokeStyle = "#aef"; ctx.lineWidth = 1.2;
-        ctx.beginPath(); ctx.moveTo(-9, 2); ctx.lineTo(-18, 4); ctx.moveTo(-9, -2); ctx.lineTo(-18, -4); ctx.stroke();
+        ctx.translate(sx,sy); ctx.rotate(angle);
+        ctx.fillStyle=col; ctx.strokeStyle="rgba(255,255,255,0.8)"; ctx.lineWidth=0.8;
+        ctx.beginPath(); ctx.ellipse(0,0,7,3.5,0,0,Math.PI*2); ctx.fill(); ctx.stroke();
         ctx.restore();
         ctx.save();
-        ctx.fillStyle = "#fff"; ctx.font = `bold ${Math.max(7, 9 * cam.zoom)}px monospace`;
-        ctx.textAlign = "center"; ctx.textBaseline = "middle";
-        ctx.shadowColor = "rgba(0,0,0,0.9)"; ctx.shadowBlur = 3;
-        ctx.fillText(`${ship.units}`, sx, sy - 11); ctx.restore();
+        ctx.fillStyle="#fff"; ctx.font=`bold ${Math.max(7,9*cam.zoom)}px monospace`;
+        ctx.textAlign="center"; ctx.textBaseline="middle";
+        ctx.shadowColor="rgba(0,0,0,0.9)"; ctx.shadowBlur=3;
+        ctx.fillText(`${ship.units}`,sx,sy-11); ctx.restore();
       });
 
-      // Nameplates
+      // Nameplates — show player name + balance on their territory centroid
       {
-        const sumX = new Float64Array(colors.length), sumY = new Float64Array(colors.length), cnt = new Int32Array(colors.length);
-        for (let i = 0; i < grid.length; i++) { const o = grid[i]; if (o < 0 || o >= colors.length) continue; sumX[o] += i % GRID_W; sumY[o] += Math.floor(i / GRID_W); cnt[o]++; }
-        ctx.save(); ctx.textAlign = "center"; ctx.textBaseline = "middle";
-        const bf = Math.max(6, Math.min(16, 11 / cam.zoom));
+        const sumX = new Float64Array(colors.length);
+        const sumY = new Float64Array(colors.length);
+        const cnt  = new Int32Array(colors.length);
+        // Sample: iterate grid for centroid (still needed for label placement, but only for render)
+        for (let i = 0; i < grid.length; i++) {
+          const o = grid[i]; if (o < 0 || o >= colors.length) continue;
+          sumX[o] += i % GRID_W; sumY[o] += Math.floor(i/GRID_W); cnt[o]++;
+        }
+        ctx.save(); ctx.textAlign="center"; ctx.textBaseline="middle";
+        const bf = Math.max(6, Math.min(16, 11/cam.zoom));
         playerIndexRef.current.forEach((idx, pid) => {
           if (cnt[idx] < 5) return;
           const p = playersRef.current.get(pid); if (!p || !p.alive) return;
-          const sx = mx + (sumX[idx] / cnt[idx] / GRID_W) * mw;
-          const sy = my + (sumY[idx] / cnt[idx] / GRID_H) * mh;
-          ctx.font = `bold ${bf}px sans-serif`; ctx.shadowColor = "rgba(0,0,0,0.95)"; ctx.shadowBlur = 4;
-          ctx.fillStyle = "#fff"; ctx.fillText(p.name, sx, sy - bf * 0.65);
-          ctx.font = `${bf * 0.85}px monospace`; ctx.fillStyle = "rgba(255,255,200,0.9)";
-          ctx.fillText(fmt(p.units), sx, sy + bf * 0.65); ctx.shadowBlur = 0;
+          const sx2 = mx + (sumX[idx]/cnt[idx]/GRID_W)*mw;
+          const sy2 = my + (sumY[idx]/cnt[idx]/GRID_H)*mh;
+          const bal = balanceRef.current.get(idx) ?? 0;
+          const px2 = pixelCountRef.current.get(idx) ?? 0;
+          const atCap = bal >= px2 * SOFT_CAP_MULT * 0.9;
+          ctx.font=`bold ${bf}px sans-serif`; ctx.shadowColor="rgba(0,0,0,0.95)"; ctx.shadowBlur=4;
+          ctx.fillStyle="#fff"; ctx.fillText(p.name, sx2, sy2-bf*0.65);
+          ctx.font=`${bf*0.85}px monospace`;
+          ctx.fillStyle = atCap ? "#ff4444" : "rgba(255,255,200,0.9)"; // red = at cap, need to attack!
+          ctx.fillText(fmt(bal), sx2, sy2+bf*0.65);
+          ctx.shadowBlur=0;
         });
         ctx.restore();
       }
 
-      ctx.restore(); // end camera
+      ctx.restore(); // end camera transform
 
       // Particles
       for (const p of particlesRef.current) {
         ctx.globalAlpha = p.life * 0.75; ctx.fillStyle = p.color;
-        ctx.beginPath(); ctx.arc(p.x, p.y, 1 + p.life * 2, 0, Math.PI * 2); ctx.fill();
+        ctx.beginPath(); ctx.arc(p.x,p.y,1+p.life*2,0,Math.PI*2); ctx.fill();
       }
       ctx.globalAlpha = 1;
 
-      // Mode hint
       if (placeModeRef.current || bombModeRef.current) {
-        ctx.save(); ctx.font = `${14 * devicePixelRatio}px sans-serif`;
-        ctx.fillStyle = "rgba(255,255,100,0.9)"; ctx.textAlign = "center";
+        ctx.save(); ctx.font=`${14*devicePixelRatio}px sans-serif`;
+        ctx.fillStyle="rgba(255,255,100,0.9)"; ctx.textAlign="center";
         ctx.fillText(
           placeModeRef.current
             ? `Click to place ${BUILDING_LABELS[placeModeRef.current.type]}  ·  Right-click to cancel`
             : `Click to drop ${bombModeRef.current} bomb  ·  Right-click to cancel`,
-          canvas!.width / 2, 28 * devicePixelRatio
+          canvas!.width/2, 28*devicePixelRatio
         );
         ctx.restore();
       }
@@ -692,32 +739,35 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     function loop(now: number) {
       const dt = Math.min(now - lastFrame, 100); lastFrame = now;
 
+      // Keyboard camera pan
       const cam = camRef.current; const ks = keysRef.current;
-      if (ks.has("w") || ks.has("arrowup"))    cam.y += 5;
-      if (ks.has("s") || ks.has("arrowdown"))  cam.y -= 5;
-      if (ks.has("a") || ks.has("arrowleft"))  cam.x += 5;
-      if (ks.has("d") || ks.has("arrowright")) cam.x -= 5;
+      if (ks.has("w")||ks.has("arrowup"))    cam.y += 5;
+      if (ks.has("s")||ks.has("arrowdown"))  cam.y -= 5;
+      if (ks.has("a")||ks.has("arrowleft"))  cam.x += 5;
+      if (ks.has("d")||ks.has("arrowright")) cam.x -= 5;
 
-      tickPressure(dt);
+      // Game tick — fires every TICK_MS (560ms), not every frame
+      if (now - lastTickRef.current >= TICK_MS) {
+        lastTickRef.current = now;
+        tickGame();
+      }
 
       // Ships
-      const navalBoost = new Set(buildingsRef.current.filter(b => b.type === "naval_base").map(b => b.ownerIdx));
+      const navalBoost = new Set(buildingsRef.current.filter(b=>b.type==="naval_base").map(b=>b.ownerIdx));
       shipsRef.current = shipsRef.current.filter(ship => {
-        const speed = SHIP_TILES_PER_MS / Math.max(1, ship.distanceTiles) * (navalBoost.has(ship.ownerIdx) ? 1.7 : 1);
-        ship.progress = Math.min(1, ship.progress + speed * dt);
+        const spd = SHIP_TILES_PER_MS / Math.max(1, ship.distanceTiles) * (navalBoost.has(ship.ownerIdx) ? 1.7 : 1);
+        ship.progress = Math.min(1, ship.progress + spd * dt);
         if (ship.progress >= 1) {
-          const mask2 = landMaskRef.current; const coast2 = coastMaskRef.current;
-          if (mask2 && coast2) {
-            const gr = ownerGridRef.current, st = strengthGridRef.current;
-            const ltx = ship.targetGridIdx % GRID_W, lty = Math.floor(ship.targetGridIdx / GRID_W);
-            for (let dy = -4; dy <= 4; dy++) for (let dx = -4; dx <= 4; dx++) {
-              if (Math.abs(dx) + Math.abs(dy) > 4) continue;
-              const nx = ltx + dx, ny = lty + dy;
-              if (nx < 0 || ny < 0 || nx >= GRID_W || ny >= GRID_H) continue;
-              const ni = ny * GRID_W + nx;
-              if (!mask2[ni]) continue;
-              if (gr[ni] !== ship.ownerIdx) { gr[ni] = ship.ownerIdx; st[ni] = Math.min(MAX_STRENGTH, Math.max(5, ship.units * 0.15)); }
-            }
+          const mask2 = landMaskRef.current; if (!mask2) return false;
+          const gr = ownerGridRef.current;
+          const ltx = ship.targetGridIdx % GRID_W, lty = Math.floor(ship.targetGridIdx / GRID_W);
+          for (let dy=-4; dy<=4; dy++) for (let dx=-4; dx<=4; dx++) {
+            if (Math.abs(dx)+Math.abs(dy)>4) continue;
+            const nx=ltx+dx, ny=lty+dy;
+            if (nx<0||ny<0||nx>=GRID_W||ny>=GRID_H) continue;
+            const ni = ny*GRID_W+nx;
+            if (!mask2[ni] || gr[ni] === ship.ownerIdx) continue;
+            flipTile(ni, ship.ownerIdx);
           }
           return false;
         }
@@ -728,15 +778,16 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
       radZonesRef.current = radZonesRef.current.filter(rz => { rz.strength = Math.max(0, rz.strength - rz.decay * dt * 0.01); return rz.strength > 0; });
 
       // Particles
-      particlesRef.current = particlesRef.current.filter(p => { p.x += p.vx; p.y += p.vy; p.life -= 0.025; return p.life > 0; });
-      if (particlesRef.current.length > 1000) particlesRef.current = particlesRef.current.slice(-500);
+      particlesRef.current = particlesRef.current.filter(p => { p.x+=p.vx; p.y+=p.vy; p.life-=0.025; return p.life>0; });
+      if (particlesRef.current.length > 1200) particlesRef.current = particlesRef.current.slice(-600);
 
       render();
 
+      // DB sync
       if (now - lastSyncRef.current > 1500) { lastSyncRef.current = now; syncStats(); }
 
-      // Bot AI
-      if (lobby.host_id === playerId && now - lastBotRef.current > 2200) {
+      // Bot AI (only host runs bots)
+      if (lobby.host_id === playerId && now - lastBotRef.current > 2500) {
         lastBotRef.current = now;
         const mask2 = landMaskRef.current; if (mask2) {
           const gr = ownerGridRef.current;
@@ -744,53 +795,71 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
             if (!bot.is_bot || !bot.alive) return;
             const idx = playerIndexRef.current.get(bot.player_id);
             if (idx === undefined || eliminatedRef.current.has(idx)) return;
-            const owned: number[] = [];
-            for (let i = 0; i < gr.length; i++) if (gr[i] === idx) owned.push(i);
-            if (owned.length === 0) {
+
+            const pixels = pixelCountRef.current.get(idx) ?? 0;
+            if (pixels === 0) {
+              // Bot needs to spawn
               const cands: number[] = [];
-              for (let i = 0; i < mask2.length; i++) if (mask2[i] && gr[i] === -1) cands.push(i);
+              for (let i = 0; i < mask2.length; i++) if (mask2[i] && gr[i]===-1) cands.push(i);
               if (cands.length === 0) return;
-              plantStarter(cands[Math.floor(Math.random() * cands.length)], idx); return;
+              plantStarter(cands[Math.floor(Math.random()*cands.length)], idx); return;
             }
-            // Build
-            const coins = bot.coins || 0;
-            if (coins > 80 && buildingsRef.current.filter(b => b.ownerIdx === idx).length < 5) {
-              const free = owned.filter(k => !buildingsRef.current.some(b => b.gridIdx === k));
+
+            // Bot building
+            const bal = balanceRef.current.get(idx) ?? 0;
+            if (bal > 80 && buildingsRef.current.filter(b=>b.ownerIdx===idx).length < 5) {
+              const owned: number[] = [];
+              for (let i=0;i<gr.length;i++) if (gr[i]===idx) owned.push(i);
+              const free = owned.filter(k=>!buildingsRef.current.some(b=>b.gridIdx===k));
               if (free.length > 0) {
-                const pick = free[Math.floor(Math.random() * free.length)];
-                const btype: BuildingType = coins > 200 ? "factory" : coins > 120 ? "defense_post" : "city";
+                const pick = free[Math.floor(Math.random()*free.length)];
+                const btype: BuildingType = bal>200 ? "factory" : bal>120 ? "defense_post" : "city";
                 const [cc] = BUILD_COST[btype];
-                if (coins >= cc) {
-                  const bld: Building = { type: btype, ownerIdx: idx, gridIdx: pick };
-                  buildingsRef.current = [...buildingsRef.current, bld]; setBuildings(prev => [...prev, bld]);
-                  channelRef.current?.send({ type: "broadcast", event: "building", payload: bld });
-                  bot.coins = (bot.coins || 0) - cc;
+                if (bal >= cc) {
+                  const bld: Building = { type:btype, ownerIdx:idx, gridIdx:pick };
+                  buildingsRef.current=[...buildingsRef.current,bld]; setBuildings(prev=>[...prev,bld]);
+                  channelRef.current?.send({ type:"broadcast", event:"building", payload:bld });
+                  balanceRef.current.set(idx, bal-cc);
                 }
               }
             }
-            if (bot.units < 20) return;
-            const neutral: number[] = [], enemy: number[] = [];
-            for (const i of owned) {
-              const x2 = i % GRID_W, y2 = Math.floor(i / GRID_W);
-              for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const) {
-                const nx = x2 + dx, ny = y2 + dy;
-                if (nx < 0 || ny < 0 || nx >= GRID_W || ny >= GRID_H) continue;
-                const ni = ny * GRID_W + nx; if (!mask2[ni]) continue;
-                if (gr[ni] === -1) neutral.push(ni); else if (gr[ni] !== idx) enemy.push(ni);
+
+            // Bot picks attack target: prefer neutral, then weakest enemy
+            const borderSet = borderTilesRef.current.get(idx);
+            if (!borderSet || borderSet.size === 0) return;
+            let targetOwner = -1; // -1 = neutral
+            const neighborOwners = new Map<number, number>(); // owner → tile count
+            for (const bi of borderSet) {
+              for (const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1]] as const) {
+                const nx=(bi%GRID_W)+dx, ny=Math.floor(bi/GRID_W)+dy;
+                if (nx<0||ny<0||nx>=GRID_W||ny>=GRID_H) continue;
+                const ni=ny*GRID_W+nx;
+                if (!mask2[ni]) continue;
+                const no=gr[ni]; if (no===idx) continue;
+                neighborOwners.set(no, (neighborOwners.get(no)??0)+1);
               }
             }
-            let target = -1;
-            if (neutral.length > 0 && bot.units > 30) target = neutral[Math.floor(Math.random() * neutral.length)];
-            else if (enemy.length > 0 && bot.units > 100) target = enemy[Math.floor(Math.random() * enemy.length)];
-            if (target === -1) return;
-            const bt: AttackTarget = { ownerIdx: idx, targetIdx: target, unitType: "infantry" };
-            botTargetsRef.current.set(idx, bt);
-            channelRef.current?.send({ type: "broadcast", event: "target", payload: bt });
+            if (neighborOwners.size > 0) {
+              // Prefer neutral first
+              if (neighborOwners.has(-1)) { targetOwner = -1; }
+              else {
+                // Pick weakest enemy by balance
+                let weakest = Infinity, weakestOwner = -1;
+                neighborOwners.forEach((_, no) => {
+                  if (no < 0) return;
+                  const b = balanceRef.current.get(no) ?? 0;
+                  if (b < weakest) { weakest = b; weakestOwner = no; }
+                });
+                targetOwner = weakestOwner;
+              }
+            }
+            botTargetsRef.current.set(idx, targetOwner);
+            channelRef.current?.send({ type:"broadcast", event:"bot_target", payload:{ ownerIdx:idx, targetIdx:targetOwner } });
           });
         }
       }
 
-      setTick(t => (t + 1) % 1000000);
+      setTick(t => (t+1) % 1_000_000);
       raf = requestAnimationFrame(loop);
     }
     raf = requestAnimationFrame(loop);
@@ -799,59 +868,45 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     function onWheel(e: WheelEvent) {
       e.preventDefault();
       const r = canvas!.getBoundingClientRect();
-      const mx2 = (e.clientX - r.left) * devicePixelRatio, my2 = (e.clientY - r.top) * devicePixelRatio;
+      const mx2=(e.clientX-r.left)*devicePixelRatio, my2=(e.clientY-r.top)*devicePixelRatio;
       const factor = e.deltaY < 0 ? 1.15 : 0.87;
-      const c = camRef.current, newZoom = Math.min(10, Math.max(0.3, c.zoom * factor));
-      c.x = mx2 - (mx2 - c.x) * (newZoom / c.zoom); c.y = my2 - (my2 - c.y) * (newZoom / c.zoom); c.zoom = newZoom;
+      const c = camRef.current, newZoom = Math.min(12, Math.max(0.25, c.zoom * factor));
+      c.x = mx2-(mx2-c.x)*(newZoom/c.zoom); c.y = my2-(my2-c.y)*(newZoom/c.zoom); c.zoom = newZoom;
     }
     function onMouseDown(e: MouseEvent) {
       if (e.button === 1 || e.button === 2) {
         e.preventDefault(); dragMovedRef.current = false;
-        dragRef.current = { active: true, startX: e.clientX, startY: e.clientY, camX: camRef.current.x, camY: camRef.current.y };
+        dragRef.current = { active:true, startX:e.clientX, startY:e.clientY, camX:camRef.current.x, camY:camRef.current.y };
       }
     }
     function onMouseMove(e: MouseEvent) {
       if (!dragRef.current.active) return;
-      const dx = (e.clientX - dragRef.current.startX) * devicePixelRatio;
-      const dy = (e.clientY - dragRef.current.startY) * devicePixelRatio;
-      if (Math.abs(dx) > 3 || Math.abs(dy) > 3) dragMovedRef.current = true;
-      camRef.current.x = dragRef.current.camX + dx; camRef.current.y = dragRef.current.camY + dy;
+      const dx=(e.clientX-dragRef.current.startX)*devicePixelRatio;
+      const dy=(e.clientY-dragRef.current.startY)*devicePixelRatio;
+      if (Math.abs(dx)>3||Math.abs(dy)>3) dragMovedRef.current=true;
+      camRef.current.x=dragRef.current.camX+dx; camRef.current.y=dragRef.current.camY+dy;
     }
-    function onMouseUp() { dragRef.current.active = false; }
+    function onMouseUp() { dragRef.current.active=false; }
     function onKeyDown(e: KeyboardEvent) {
       keysRef.current.add(e.key.toLowerCase());
-      if (e.key === "c" || e.key === "C") {
-        const myIdx = playerIndexRef.current.get(playerId); if (myIdx === undefined) return;
-        const gr = ownerGridRef.current; let sx = 0, sy = 0, cnt = 0;
-        for (let i = 0; i < gr.length; i++) if (gr[i] === myIdx) { sx += i % GRID_W; sy += Math.floor(i / GRID_W); cnt++; }
-        if (cnt === 0) return;
-        const mr2 = mapRectRef.current;
-        const wx = mr2.x + (sx / cnt / GRID_W) * mr2.w, wy = mr2.y + (sy / cnt / GRID_H) * mr2.h;
-        camRef.current.x = canvas!.width / 2 - wx * camRef.current.zoom;
-        camRef.current.y = canvas!.height / 2 - wy * camRef.current.zoom;
-      }
-      if (e.key === "Escape") {
-        setPlaceMode(null); placeModeRef.current = null;
-        setBombMode(null); bombModeRef.current = null;
-        myTargetRef.current = null;
-        setAttackTarget(null);
+      if (e.key==="c"||e.key==="C") centerCamera();
+      if (e.key==="Escape") {
+        setPlaceMode(null); placeModeRef.current=null;
+        setBombMode(null); bombModeRef.current=null;
+        myAttackTargetRef.current=-1; setAttackingPlayer(null);
       }
       const num = parseInt(e.key);
-      if (num >= 1 && num <= 8) {
-        const toolbar: BuildingType[] = ["city", "factory", "port", "naval_base", "defense_post", "fort", "missile_silo", "sam_launcher"];
-        const btype = toolbar[num - 1];
+      if (num>=1&&num<=8) {
+        const btype = TOOLBAR[num-1];
         if (btype) {
-          if (placeModeRef.current?.type === btype) { setPlaceMode(null); placeModeRef.current = null; }
-          else { setPlaceMode({ type: btype }); placeModeRef.current = { type: btype }; setBombMode(null); bombModeRef.current = null; }
+          if (placeModeRef.current?.type===btype) { setPlaceMode(null); placeModeRef.current=null; }
+          else { setPlaceMode({type:btype}); placeModeRef.current={type:btype}; setBombMode(null); bombModeRef.current=null; }
         }
       }
-      if (e.key === "q" || e.key === "Q") { setUnitType("infantry"); unitTypeRef.current = "infantry"; }
-      if (e.key === "e" || e.key === "E") { setUnitType("tank"); unitTypeRef.current = "tank"; }
-      if (e.key === "r" || e.key === "R") { setUnitType("warship"); unitTypeRef.current = "warship"; }
     }
     function onKeyUp(e: KeyboardEvent) { keysRef.current.delete(e.key.toLowerCase()); }
 
-    canvas.addEventListener("wheel", onWheel, { passive: false });
+    canvas.addEventListener("wheel", onWheel, { passive:false });
     canvas.addEventListener("mousedown", onMouseDown);
     window.addEventListener("mousemove", onMouseMove);
     window.addEventListener("mouseup", onMouseUp);
@@ -864,172 +919,152 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
       window.removeEventListener("mousemove", onMouseMove); window.removeEventListener("mouseup", onMouseUp);
       window.removeEventListener("keydown", onKeyDown); window.removeEventListener("keyup", onKeyUp);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lobby.id, lobby.host_id, lobby.difficulty, playerId]);
 
-  // ── Plant starter ─────────────────────────────────────────────────────────
+  // ── Plant starter territory ───────────────────────────────────────────────
   function plantStarter(centerIdx: number, ownerIdx: number) {
     const mask = landMaskRef.current; if (!mask) return;
-    const grid = ownerGridRef.current, str = strengthGridRef.current;
+    const claims: { i: number; o: number }[] = [];
     const cx = centerIdx % GRID_W, cy = Math.floor(centerIdx / GRID_W);
-    const claims: { i: number; o: number; s: number }[] = [];
-    for (let dy = -STARTER_RADIUS; dy <= STARTER_RADIUS; dy++) {
-      for (let dx = -STARTER_RADIUS; dx <= STARTER_RADIUS; dx++) {
-        const x = cx + dx, y = cy + dy;
-        if (x < 0 || y < 0 || x >= GRID_W || y >= GRID_H) continue;
-        const i = y * GRID_W + x;
-        if (mask[i] && grid[i] === -1) { grid[i] = ownerIdx; str[i] = MAX_STRENGTH; claims.push({ i, o: ownerIdx, s: MAX_STRENGTH }); }
+    for (let dy=-STARTER_RADIUS; dy<=STARTER_RADIUS; dy++) {
+      for (let dx=-STARTER_RADIUS; dx<=STARTER_RADIUS; dx++) {
+        const x=cx+dx, y=cy+dy;
+        if (x<0||y<0||x>=GRID_W||y>=GRID_H) continue;
+        const i = y*GRID_W+x;
+        if (mask[i] && ownerGridRef.current[i]===-1) {
+          claims.push(flipTile(i, ownerIdx));
+        }
       }
     }
-    if (claims.length > 0) channelRef.current?.send({ type: "broadcast", event: "claim", payload: claims });
+    balanceRef.current.set(ownerIdx, 200); // starting balance
+    if (claims.length > 0) channelRef.current?.send({ type:"broadcast", event:"claim", payload:claims });
   }
 
-  // ── Set attack target ─────────────────────────────────────────────────────
-  function setMyTarget(targetIdx: number, ownerIdx: number, targetName?: string) {
+  // ── Center camera on own territory ───────────────────────────────────────
+  function centerCamera() {
     const myIdx = playerIndexRef.current.get(playerId); if (myIdx === undefined) return;
-    const target: AttackTarget = { ownerIdx, targetIdx, unitType: unitTypeRef.current };
-    myTargetRef.current = target;
-    channelRef.current?.send({ type: "broadcast", event: "target", payload: target });
-    setAttackTarget(targetName ? { name: targetName } : null);
+    const grid = ownerGridRef.current;
+    let sx=0, sy=0, cnt=0;
+    for (let i=0;i<grid.length;i++) if (grid[i]===myIdx) { sx+=i%GRID_W; sy+=Math.floor(i/GRID_W); cnt++; }
+    if (cnt===0) return;
+    const mr = mapRectRef.current; const cv = canvasRef.current;
+    const wx = mr.x+(sx/cnt/GRID_W)*mr.w, wy = mr.y+(sy/cnt/GRID_H)*mr.h;
+    camRef.current.x = (cv?.width??0)/2 - wx*camRef.current.zoom;
+    camRef.current.y = (cv?.height??0)/2 - wy*camRef.current.zoom;
   }
 
   // ── Naval attack ──────────────────────────────────────────────────────────
-  function launchShip(targetIdx: number, ownerIdx: number, ownerPid: string) {
-    const coast = coastMaskRef.current; if (!coast) return;
-    const mask = landMaskRef.current;
-    if (!mask || !mask[targetIdx]) { notify("Ships can only attack land tiles", "error"); return; }
-
+  function launchShip(targetIdx: number, ownerIdx: number, pid: string) {
+    const coast = coastMaskRef.current, mask = landMaskRef.current;
+    if (!coast || !mask || !mask[targetIdx]) { notify("Ships can only attack land tiles", "error"); return; }
     const grid = ownerGridRef.current;
-    let bestFrom = -1, bestDist = Infinity;
-    for (let i = 0; i < grid.length; i++) {
-      if (grid[i] !== ownerIdx || !coast[i]) continue;
-      const d = Math.abs(i % GRID_W - targetIdx % GRID_W) + Math.abs(Math.floor(i / GRID_W) - Math.floor(targetIdx / GRID_W));
-      if (d < bestDist) { bestDist = d; bestFrom = i; }
+    let bestFrom=-1, bestDist=Infinity;
+    for (let i=0; i<grid.length; i++) {
+      if (grid[i]!==ownerIdx || !coast[i]) continue;
+      const d = Math.abs(i%GRID_W-targetIdx%GRID_W)+Math.abs(Math.floor(i/GRID_W)-Math.floor(targetIdx/GRID_W));
+      if (d < bestDist) { bestDist=d; bestFrom=i; }
     }
-    if (bestFrom === -1) { notify("Need a coastal tile to launch ships", "error"); return; }
-
-    let landingIdx = targetIdx;
-    if (!coast[targetIdx]) {
-      let nearestCoast = -1, nearestDist = Infinity;
-      const tx = targetIdx % GRID_W, ty = Math.floor(targetIdx / GRID_W);
-      for (let i = 0; i < coast.length; i++) {
-        if (!coast[i] || grid[i] === ownerIdx) continue;
-        const d = Math.abs(i % GRID_W - tx) + Math.abs(Math.floor(i / GRID_W) - ty);
-        if (d < nearestDist) { nearestDist = d; nearestCoast = i; }
-      }
-      if (nearestCoast !== -1 && nearestDist < 30) landingIdx = nearestCoast;
-    }
-
-    const mr = mapRectRef.current, cW = mr.w / GRID_W, cH = mr.h / GRID_H;
-    const me = playersRef.current.get(ownerPid); if (!me) return;
-    const sendUnits = Math.max(1, Math.floor(me.units * deployPctRef.current / 100));
-    const dist = Math.abs(bestFrom % GRID_W - landingIdx % GRID_W) + Math.abs(Math.floor(bestFrom / GRID_W) - Math.floor(landingIdx / GRID_W));
-
+    if (bestFrom===-1) { notify("Need a coastal tile to launch ships", "error"); return; }
+    const mr=mapRectRef.current, cW=mr.w/GRID_W, cH=mr.h/GRID_H;
+    const bal = balanceRef.current.get(ownerIdx) ?? 0;
+    const sendBal = Math.floor(bal * attackPctRef.current / 100);
+    const dist = Math.abs(bestFrom%GRID_W-targetIdx%GRID_W)+Math.abs(Math.floor(bestFrom/GRID_W)-Math.floor(targetIdx/GRID_W));
     const ship: Ship = {
       id: crypto.randomUUID(), ownerIdx,
-      fromX: mr.x + (bestFrom % GRID_W + 0.5) * cW, fromY: mr.y + (Math.floor(bestFrom / GRID_W) + 0.5) * cH,
-      toX:   mr.x + (landingIdx % GRID_W + 0.5) * cW, toY: mr.y + (Math.floor(landingIdx / GRID_W) + 0.5) * cH,
-      units: sendUnits, targetGridIdx: landingIdx, progress: 0,
-      distanceTiles: Math.max(1, dist),
+      fromX: mr.x+(bestFrom%GRID_W+0.5)*cW, fromY: mr.y+(Math.floor(bestFrom/GRID_W)+0.5)*cH,
+      toX: mr.x+(targetIdx%GRID_W+0.5)*cW,   toY: mr.y+(Math.floor(targetIdx/GRID_W)+0.5)*cH,
+      units: sendBal, targetGridIdx: targetIdx, progress: 0, distanceTiles: Math.max(1, dist),
     };
-    shipsRef.current = [...shipsRef.current, ship];
-    channelRef.current?.send({ type: "broadcast", event: "ship", payload: ship });
-    me.units = Math.max(0, me.units - sendUnits);
-    supabase.from("lobby_players").update({ units: me.units }).eq("lobby_id", lobby.id).eq("player_id", ownerPid);
-    const etaSec = Math.round(dist / (SHIP_TILES_PER_MS * 1000));
-    notify(`Fleet of ${sendUnits} launched — ETA ~${etaSec}s`, "success");
+    shipsRef.current=[...shipsRef.current, ship];
+    channelRef.current?.send({ type:"broadcast", event:"ship", payload:ship });
+    balanceRef.current.set(ownerIdx, Math.max(0, bal - sendBal));
+    const etaSec = Math.round(dist/(SHIP_TILES_PER_MS*1000));
+    notify(`Fleet of ${fmt(sendBal)} launched — ETA ~${etaSec}s`, "success");
   }
 
   // ── Drop bomb ─────────────────────────────────────────────────────────────
-  function dropBomb(targetIdx: number, btype: BombType, ownerPid: string) {
-    const me = playersRef.current.get(ownerPid); if (!me) return;
+  function dropBomb(targetIdx: number, btype: BombType, pid: string) {
+    const myIdx = playerIndexRef.current.get(pid); if (myIdx === undefined) return;
     const cost = BOMB_COST[btype];
-    if ((me.coins || 0) < cost) { notify(`Need ${cost} coins`, "error"); return; }
-    const myIdx = playerIndexRef.current.get(ownerPid);
-    const grid = ownerGridRef.current, str = strengthGridRef.current;
-    const tx = targetIdx % GRID_W, ty = Math.floor(targetIdx / GRID_W), radius = BOMB_RADIUS[btype];
+    const bal = balanceRef.current.get(myIdx) ?? 0;
+    if (bal < cost) { notify(`Need ${cost} balance`, "error"); return; }
+    const grid = ownerGridRef.current;
+    const tx = targetIdx%GRID_W, ty = Math.floor(targetIdx/GRID_W), radius = BOMB_RADIUS[btype];
     let intercepted = false;
     buildingsRef.current.forEach(b => {
-      if (b.type !== "sam_launcher") return;
-      const cur = grid[b.gridIdx]; if (cur === myIdx || cur === -1) return;
-      const bx = b.gridIdx % GRID_W, by = Math.floor(b.gridIdx / GRID_W);
-      if (Math.abs(bx - tx) + Math.abs(by - ty) < radius * 3 && Math.random() < 0.4) intercepted = true;
+      if (b.type!=="sam_launcher") return;
+      const cur=grid[b.gridIdx]; if (cur===myIdx||cur===-1) return;
+      const bx=b.gridIdx%GRID_W, by2=Math.floor(b.gridIdx/GRID_W);
+      if (Math.abs(bx-tx)+Math.abs(by2-ty)<radius*3 && Math.random()<0.4) intercepted=true;
     });
     if (intercepted) { notify("Intercepted by SAM!", "error"); return; }
-    me.coins = (me.coins || 0) - cost;
-    supabase.from("lobby_players").update({ coins: me.coins }).eq("lobby_id", lobby.id).eq("player_id", ownerPid);
-    const mask = landMaskRef.current; if (!mask) return;
+    balanceRef.current.set(myIdx, bal - cost);
+    const mask=landMaskRef.current; if (!mask) return;
     const affected: number[] = [];
-    for (let dy2 = -radius; dy2 <= radius; dy2++) for (let dx2 = -radius; dx2 <= radius; dx2++) {
-      if (Math.abs(dx2) + Math.abs(dy2) > radius) continue;
-      const nx = tx + dx2, ny = ty + dy2;
-      if (nx < 0 || ny < 0 || nx >= GRID_W || ny >= GRID_H || !mask[ny * GRID_W + nx]) continue;
-      affected.push(ny * GRID_W + nx);
+    for (let dy2=-radius;dy2<=radius;dy2++) for (let dx2=-radius;dx2<=radius;dx2++) {
+      if (Math.abs(dx2)+Math.abs(dy2)>radius) continue;
+      const nx=tx+dx2, ny=ty+dy2;
+      if (nx<0||ny<0||nx>=GRID_W||ny>=GRID_H||!mask[ny*GRID_W+nx]) continue;
+      affected.push(ny*GRID_W+nx);
     }
-    const destroyed = buildingsRef.current.filter(b => affected.includes(b.gridIdx));
-    buildingsRef.current = buildingsRef.current.filter(b => !affected.includes(b.gridIdx));
-    setBuildings(prev => prev.filter(b => !affected.includes(b.gridIdx)));
-    if (destroyed.length > 0) notify(`${destroyed.length} building(s) destroyed!`, "info");
-    affected.forEach(i => { grid[i] = -1; str[i] = 0; });
-    channelRef.current?.send({ type: "broadcast", event: "claim", payload: affected.map(i => ({ i, o: -1, s: 0 })) });
-    const radStr = BOMB_RAD[btype];
-    const newZones: RadZone[] = affected.map(i => ({ gridIdx: i, strength: radStr, decay: btype === "dirty" ? 0.05 : 0.3 }));
-    radZonesRef.current = [...radZonesRef.current, ...newZones];
-    channelRef.current?.send({ type: "broadcast", event: "rad_zone", payload: newZones });
-    const mr = mapRectRef.current, cam = camRef.current;
-    const scx = cam.x + (mr.x + (tx + 0.5) / GRID_W * mr.w) * cam.zoom;
-    const scy = cam.y + (mr.y + (ty + 0.5) / GRID_H * mr.h) * cam.zoom;
-    const bombCol = btype === "dirty" ? "#22c55e" : btype === "hydrogen" ? "#818cf8" : "#f97316";
-    for (let pi = 0; pi < 80; pi++) {
-      const ang = Math.random() * Math.PI * 2, spd = 1 + Math.random() * 5;
-      particlesRef.current.push({ x: scx, y: scy, vx: Math.cos(ang) * spd, vy: Math.sin(ang) * spd, life: 1, color: bombCol });
+    buildingsRef.current=buildingsRef.current.filter(b=>!affected.includes(b.gridIdx));
+    setBuildings(prev=>prev.filter(b=>!affected.includes(b.gridIdx)));
+    affected.forEach(i => flipTile(i, -1));
+    channelRef.current?.send({ type:"broadcast", event:"claim", payload:affected.map(i=>({i,o:-1})) });
+    const radStr=BOMB_RAD[btype];
+    const newZones: RadZone[] = affected.map(i=>({ gridIdx:i, strength:radStr, decay:btype==="dirty"?0.05:0.3 }));
+    radZonesRef.current=[...radZonesRef.current,...newZones];
+    channelRef.current?.send({ type:"broadcast", event:"rad_zone", payload:newZones });
+    const mr=mapRectRef.current, cam=camRef.current;
+    const scx=cam.x+(mr.x+(tx+0.5)/GRID_W*mr.w)*cam.zoom;
+    const scy=cam.y+(mr.y+(ty+0.5)/GRID_H*mr.h)*cam.zoom;
+    const bombCol=btype==="dirty"?"#22c55e":btype==="hydrogen"?"#818cf8":"#f97316";
+    for (let pi=0;pi<80;pi++) {
+      const ang=Math.random()*Math.PI*2, spd=1+Math.random()*5;
+      particlesRef.current.push({ x:scx, y:scy, vx:Math.cos(ang)*spd, vy:Math.sin(ang)*spd, life:1, color:bombCol });
     }
-    notify(`${btype.charAt(0).toUpperCase() + btype.slice(1)} bomb detonated!`, "success");
-  }
-
-  // ── Build cost (scales with count) ────────────────────────────────────────
-  function getBuildCost(type: BuildingType, ownerIdx: number): [number, number] {
-    const [bc, bu] = BUILD_COST[type];
-    const n = buildingsRef.current.filter(b => b.ownerIdx === ownerIdx && b.type === type).length;
-    return [Math.round(bc * (1 + n * 0.5)), Math.round(bu * (1 + n * 0.5))];
+    notify(`${btype.charAt(0).toUpperCase()+btype.slice(1)} bomb detonated!`, "success");
   }
 
   // ── Place building ────────────────────────────────────────────────────────
+  function getBuildCost(type: BuildingType, ownerIdx: number): number {
+    const [bc] = BUILD_COST[type];
+    const n = buildingsRef.current.filter(b=>b.ownerIdx===ownerIdx&&b.type===type).length;
+    return Math.round(bc * (1 + n * 0.5));
+  }
+
   function doPlaceBuilding(gx: number, gy: number, type: BuildingType) {
-    setPlaceMode(null); placeModeRef.current = null;
-    const me = playersRef.current.get(playerId); if (!me) return;
+    setPlaceMode(null); placeModeRef.current=null;
     const myIdx = playerIndexRef.current.get(playerId); if (myIdx === undefined) return;
-    const gridIdx = gy * GRID_W + gx;
+    const gridIdx = gy*GRID_W+gx;
     if (ownerGridRef.current[gridIdx] !== myIdx) { notify("Build on your own territory", "error"); return; }
-    if (buildingsRef.current.some(b => b.gridIdx === gridIdx)) { notify("Already a building here", "error"); return; }
-    if (type === "port" || type === "naval_base") {
-      const coast = coastMaskRef.current;
-      if (!coast || !coast[gridIdx]) { notify("Ports need a coastal tile", "error"); return; }
+    if (buildingsRef.current.some(b=>b.gridIdx===gridIdx)) { notify("Already a building here", "error"); return; }
+    if (type==="port"||type==="naval_base") {
+      if (!coastMaskRef.current?.[gridIdx]) { notify("Ports need a coastal tile", "error"); return; }
     }
-    const [cc, cu] = getBuildCost(type, myIdx);
-    if ((me.coins || 0) < cc) { notify(`Need ${cc} coins`, "error"); return; }
-    if (me.units < cu) { notify(`Need ${cu} units`, "error"); return; }
-    const building: Building = { type, ownerIdx: myIdx, gridIdx };
-    setBuildings(prev => [...prev, building]); buildingsRef.current = [...buildingsRef.current, building];
-    channelRef.current?.send({ type: "broadcast", event: "building", payload: building });
-    me.coins = (me.coins || 0) - cc; me.units -= cu;
-    supabase.from("lobby_players").update({ coins: me.coins, units: me.units }).eq("lobby_id", lobby.id).eq("player_id", playerId);
+    const cost = getBuildCost(type, myIdx);
+    const bal = balanceRef.current.get(myIdx) ?? 0;
+    if (bal < cost) { notify(`Need ${cost} balance`, "error"); return; }
+    const building: Building = { type, ownerIdx:myIdx, gridIdx };
+    setBuildings(prev=>[...prev,building]); buildingsRef.current=[...buildingsRef.current,building];
+    channelRef.current?.send({ type:"broadcast", event:"building", payload:building });
+    balanceRef.current.set(myIdx, bal - cost);
     notify(`${BUILDING_LABELS[type]} built!`, "success");
   }
 
   // ── Click handler ─────────────────────────────────────────────────────────
   function handleClick(e: React.MouseEvent) {
-    if (dragMovedRef.current) { dragMovedRef.current = false; return; }
+    if (dragMovedRef.current) { dragMovedRef.current=false; return; }
     const coords = screenToGrid(e.clientX, e.clientY); if (!coords) return;
     const { gx, gy } = coords;
-    const me = playersRef.current.get(playerId); if (!me) return;
     const myIdx = playerIndexRef.current.get(playerId); if (myIdx === undefined) return;
-    const i = gy * GRID_W + gx;
+    const i = gy*GRID_W+gx;
     const mask = landMaskRef.current; if (!mask) return;
 
     if (bombModeRef.current) {
       dropBomb(i, bombModeRef.current, playerId);
-      setBombMode(null); bombModeRef.current = null; return;
+      setBombMode(null); bombModeRef.current=null; return;
     }
     if (placeModeRef.current) {
       if (!mask[i]) { notify("Click on land", "error"); return; }
@@ -1037,62 +1072,69 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     }
 
     const grid = ownerGridRef.current;
-    let hasTerritory = false;
-    for (let k = 0; k < grid.length; k++) if (grid[k] === myIdx) { hasTerritory = true; break; }
-    if (!hasTerritory) {
+    const pixels = pixelCountRef.current.get(myIdx) ?? 0;
+
+    // First click = spawn
+    if (pixels === 0 && !hasSpawned) {
       if (!mask[i]) { notify("Click on land to start", "error"); return; }
       if (grid[i] !== -1) { notify("Pick an unclaimed tile", "error"); return; }
       plantStarter(i, myIdx); setHasSpawned(true);
       notify("Empire founded! Click enemy territory to attack.", "success"); return;
     }
 
+    // Click own territory = cancel attack
     if (grid[i] === myIdx) {
-      myTargetRef.current = null;
-      setAttackTarget(null);
-      notify("Attack cancelled", "info"); return;
+      myAttackTargetRef.current = -1;
+      setAttackingPlayer(null);
+      notify("Attack cancelled — troops defending all borders", "info"); return;
     }
 
     if (!mask[i]) { notify("Click on land", "error"); return; }
 
-    // Check land reachability
+    const clickedOwner = grid[i];
+
+    // Check land reachability via BFS from border
     let reachable = false;
     {
-      const reach = new Uint8Array(grid.length); const q: number[] = [];
-      for (let k = 0; k < grid.length; k++) {
-        if (grid[k] !== myIdx) continue;
-        const x2 = k % GRID_W, y2 = Math.floor(k / GRID_W);
-        for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const) {
-          const nx = x2 + dx, ny = y2 + dy;
-          if (nx < 0 || ny < 0 || nx >= GRID_W || ny >= GRID_H) continue;
-          const ni = ny * GRID_W + nx;
-          if (!reach[ni] && mask[ni] && grid[ni] !== myIdx) { reach[ni] = 1; q.push(ni); }
+      const reach = new Uint8Array(grid.length);
+      const q: number[] = [];
+      for (let k=0;k<grid.length;k++) {
+        if (grid[k]!==myIdx) continue;
+        const x2=k%GRID_W, y2=Math.floor(k/GRID_W);
+        for (const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1]] as const) {
+          const nx=x2+dx, ny=y2+dy;
+          if (nx<0||ny<0||nx>=GRID_W||ny>=GRID_H) continue;
+          const ni=ny*GRID_W+nx;
+          if (!reach[ni]&&mask[ni]&&grid[ni]!==myIdx) { reach[ni]=1; q.push(ni); }
         }
       }
-      let h = 0;
-      while (h < q.length) {
-        const cur = q[h++]; if (cur === i) { reachable = true; break; }
-        const x2 = cur % GRID_W, y2 = Math.floor(cur / GRID_W);
-        for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const) {
-          const nx = x2 + dx, ny = y2 + dy;
-          if (nx < 0 || ny < 0 || nx >= GRID_W || ny >= GRID_H) continue;
-          const ni = ny * GRID_W + nx;
-          if (!reach[ni] && mask[ni]) { reach[ni] = 1; q.push(ni); }
+      let h=0;
+      while (h<q.length) {
+        const cur=q[h++]; if (cur===i) { reachable=true; break; }
+        const x2=cur%GRID_W, y2=Math.floor(cur/GRID_W);
+        for (const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1]] as const) {
+          const nx=x2+dx, ny=y2+dy;
+          if (nx<0||ny<0||nx>=GRID_W||ny>=GRID_H) continue;
+          const ni=ny*GRID_W+nx;
+          if (!reach[ni]&&mask[ni]) { reach[ni]=1; q.push(ni); }
         }
       }
     }
 
     if (reachable) {
-      const targetOwnerIdx = grid[i];
-      let targetName: string | undefined;
-      if (targetOwnerIdx >= 0) {
-        const entry = [...playerIndexRef.current.entries()].find(([, v]) => v === targetOwnerIdx);
-        if (entry) targetName = playersRef.current.get(entry[0])?.name;
+      // Set attack target — the whole border will now push toward this owner
+      myAttackTargetRef.current = clickedOwner; // -1 for neutral
+      if (clickedOwner >= 0) {
+        const entry = [...playerIndexRef.current.entries()].find(([,v])=>v===clickedOwner);
+        const name = entry ? playersRef.current.get(entry[0])?.name : undefined;
+        setAttackingPlayer(name ?? null);
+        notify(`Attacking ${name ?? "player"}! Your whole border pushes toward them.`, "info");
+      } else {
+        setAttackingPlayer(null);
+        notify("Expanding into neutral territory", "info");
       }
-      setMyTarget(i, myIdx, targetName);
-      if (targetName) notify(`Attacking ${targetName}!`, "info");
-      else notify("Pushing into neutral territory", "info");
     } else {
-      const hasPort = buildingsRef.current.some(b => b.ownerIdx === myIdx && b.type === "port");
+      const hasPort = buildingsRef.current.some(b=>b.ownerIdx===myIdx&&b.type==="port");
       if (hasPort) launchShip(i, myIdx, playerId);
       else notify("No land path — build a Port for naval attacks", "error");
     }
@@ -1102,20 +1144,19 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     e.preventDefault();
     if (placeModeRef.current || bombModeRef.current) {
       setPlaceMode(null); setBombMode(null);
-      placeModeRef.current = null; bombModeRef.current = null; return;
+      placeModeRef.current=null; bombModeRef.current=null; return;
     }
-    if (myTargetRef.current) {
-      myTargetRef.current = null;
-      setAttackTarget(null); return;
-    }
+    myAttackTargetRef.current=-1; setAttackingPlayer(null);
   }
 
-  // ── Derived state ─────────────────────────────────────────────────────────
-  const sortedPlayers = [...players].sort((a, b) => b.pixels - a.pixels);
-  const me = playersRef.current.get(playerId);
+  // ── Derived ───────────────────────────────────────────────────────────────
+  const sortedPlayers = [...players].sort((a,b)=>b.pixels-a.pixels);
   const myIdx = playerIndexRef.current.get(playerId);
-  const hasSilo = myIdx !== undefined && buildingsRef.current.some(b => b.ownerIdx === myIdx && b.type === "missile_silo");
-  const TOOLBAR: BuildingType[] = ["city", "factory", "port", "naval_base", "defense_post", "fort", "missile_silo", "sam_launcher"];
+  const myBal = Math.floor(balanceRef.current.get(myIdx ?? -1) ?? 0);
+  const myPixels = pixelCountRef.current.get(myIdx ?? -1) ?? 0;
+  const me = playersRef.current.get(playerId);
+  const hasSilo = myIdx !== undefined && buildingsRef.current.some(b=>b.ownerIdx===myIdx&&b.type==="missile_silo");
+  const atSoftCap = myPixels > 0 && myBal >= myPixels * SOFT_CAP_MULT * 0.85;
 
   if (isDead && !isSpectating) {
     return (
@@ -1124,17 +1165,17 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
           <div className="text-6xl">💀</div>
           <div>
             <div className="text-2xl font-bold text-red-400 mb-1">Eliminated</div>
-            <div className="text-sm text-muted-foreground">Your empire has fallen. Watch the remaining players or leave.</div>
+            <div className="text-sm text-muted-foreground">Your empire has fallen.</div>
           </div>
           <div className="flex gap-3">
             <Button variant="outline" onClick={() => setIsSpectating(true)} className="gap-2">👁 Spectate</Button>
-            <Button variant="destructive" onClick={onLeave} className="gap-2"><LogOut className="h-4 w-4" /> Leave</Button>
+            <Button variant="destructive" onClick={onLeave} className="gap-2"><LogOut className="h-4 w-4" />Leave</Button>
           </div>
           <div className="w-full mt-2 border-t border-border/40 pt-3">
             <div className="text-xs font-semibold text-muted-foreground mb-2">Still alive</div>
-            {sortedPlayers.filter(p => p.alive).map(p => (
+            {sortedPlayers.filter(p=>p.alive).map(p=>(
               <div key={p.id} className="flex items-center gap-2 text-xs py-0.5">
-                <span className="h-2 w-2 rounded-sm flex-shrink-0" style={{ backgroundColor: p.color }} />
+                <span className="h-2 w-2 rounded-sm flex-shrink-0" style={{ backgroundColor:p.color }} />
                 <span className="flex-1 text-left truncate">{p.name}</span>
                 <span className="font-mono text-muted-foreground">{fmt(p.units)}</span>
               </div>
@@ -1166,26 +1207,38 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
       {me && !hasSpawned && !isDead && (
         <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 rounded-xl border border-primary/60 bg-card/95 px-6 py-4 text-center shadow-2xl backdrop-blur-md pointer-events-none">
           <div className="text-lg font-bold mb-1">Pick your starting tile</div>
-          <div className="text-sm text-muted-foreground">Click any unclaimed land tile to found your empire</div>
+          <div className="text-sm text-muted-foreground">Click any unclaimed land to found your empire</div>
         </div>
       )}
 
-      {/* Attack target indicator */}
-      {attackTarget && (
+      {/* Attack indicator */}
+      {attackingPlayer !== null && (
         <div className="absolute top-14 left-1/2 -translate-x-1/2 z-10 flex items-center gap-2 rounded-lg border border-yellow-500/60 bg-card/90 px-3 py-1.5 text-xs font-bold text-yellow-300 backdrop-blur-md shadow">
-          ⚔️ Attacking {attackTarget.name ?? "territory"} — Right-click or click own land to cancel
+          ⚔️ Attacking {attackingPlayer} — Right-click to cancel
+        </div>
+      )}
+      {attackingPlayer === null && myAttackTargetRef.current === -1 && hasSpawned && !isDead && !isSpectating && (
+        <div className="absolute top-14 left-1/2 -translate-x-1/2 z-10 flex items-center gap-2 rounded-lg border border-border/40 bg-card/70 px-3 py-1.5 text-xs text-muted-foreground backdrop-blur-md shadow">
+          Click enemy or neutral territory to attack
+        </div>
+      )}
+
+      {/* Balance at cap warning */}
+      {atSoftCap && !isDead && !isSpectating && (
+        <div className="absolute top-24 left-1/2 -translate-x-1/2 z-10 flex items-center gap-2 rounded-lg border border-red-500/60 bg-red-950/80 px-3 py-1.5 text-xs font-bold text-red-300 backdrop-blur-md shadow animate-pulse">
+          ⚠ Balance near cap — attack to keep growing!
         </div>
       )}
 
       {/* Leaderboard */}
       <div className="absolute left-3 top-3 w-56 rounded-xl border border-border/60 bg-card/85 p-2 shadow-lg backdrop-blur-md z-10">
         <div className="mb-1 px-2 text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Leaderboard</div>
-        {sortedPlayers.slice(0, 10).map((p, i) => (
-          <div key={p.id} className={`flex items-center gap-2 rounded px-2 py-0.5 text-xs ${p.player_id === playerId ? "bg-primary/15" : ""} ${!p.alive ? "opacity-40 line-through" : ""}`}>
-            <span className="w-4 text-right font-mono text-muted-foreground">{i + 1}</span>
-            <span className="h-2 w-2 rounded-sm flex-shrink-0" style={{ backgroundColor: p.color }} />
+        {sortedPlayers.slice(0,10).map((p,i)=>(
+          <div key={p.id} className={`flex items-center gap-2 rounded px-2 py-0.5 text-xs ${p.player_id===playerId?"bg-primary/15":""} ${!p.alive?"opacity-40 line-through":""}`}>
+            <span className="w-4 text-right font-mono text-muted-foreground">{i+1}</span>
+            <span className="h-2 w-2 rounded-sm flex-shrink-0" style={{ backgroundColor:p.color }} />
             <span className="flex-1 truncate font-medium">{p.name}</span>
-            <span className="font-mono text-muted-foreground text-[10px]">{p.alive ? `${p.pixels}t` : "☠"}</span>
+            <span className="font-mono text-muted-foreground text-[10px]">{p.alive?`${p.pixels}t`:"☠"}</span>
           </div>
         ))}
       </div>
@@ -1201,39 +1254,39 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         <div className="absolute bottom-3 left-1/2 -translate-x-1/2 flex flex-col items-center gap-2 z-10">
           {/* Building toolbar */}
           <div className="flex gap-1 rounded-lg border border-border/60 bg-card/90 px-2 py-1.5 backdrop-blur-md shadow-lg">
-            {TOOLBAR.map((btype, idx) => {
-              const [cc, cu] = myIdx !== undefined ? getBuildCost(btype, myIdx) : [BUILD_COST[btype][0], BUILD_COST[btype][1]];
-              const count = myIdx !== undefined ? buildingsRef.current.filter(b => b.ownerIdx === myIdx && b.type === btype).length : 0;
-              const canAfford = me && (me.coins || 0) >= cc && me.units >= cu;
+            {TOOLBAR.map((btype, idx2) => {
+              const cost = myIdx !== undefined ? getBuildCost(btype, myIdx) : BUILD_COST[btype][0];
+              const count = myIdx !== undefined ? buildingsRef.current.filter(b=>b.ownerIdx===myIdx&&b.type===btype).length : 0;
+              const canAfford = myBal >= cost;
               const isActive = placeMode?.type === btype;
               return (
-                <button key={btype} title={`[${idx + 1}] ${BUILDING_LABELS[btype]} — ${cc}💰${cu > 0 ? ` ${cu}⚔` : ""}`}
+                <button key={btype} title={`[${idx2+1}] ${BUILDING_LABELS[btype]} — ${cost} balance`}
                   disabled={!canAfford}
                   onClick={() => {
-                    if (isActive) { setPlaceMode(null); placeModeRef.current = null; return; }
-                    setPlaceMode({ type: btype }); placeModeRef.current = { type: btype };
-                    setBombMode(null); bombModeRef.current = null;
+                    if (isActive) { setPlaceMode(null); placeModeRef.current=null; return; }
+                    setPlaceMode({type:btype}); placeModeRef.current={type:btype};
+                    setBombMode(null); bombModeRef.current=null;
                   }}
-                  className={`flex flex-col items-center justify-center w-14 h-14 rounded border transition-all relative ${isActive ? "border-yellow-400 bg-yellow-400/20" : "border-border/60 bg-background/60 hover:bg-secondary/80"} disabled:opacity-35 disabled:cursor-not-allowed`}>
-                  <span className="absolute top-0.5 left-1 text-[9px] text-muted-foreground font-mono">{idx + 1}</span>
+                  className={`flex flex-col items-center justify-center w-14 h-14 rounded border transition-all relative ${isActive?"border-yellow-400 bg-yellow-400/20":"border-border/60 bg-background/60 hover:bg-secondary/80"} disabled:opacity-35 disabled:cursor-not-allowed`}>
+                  <span className="absolute top-0.5 left-1 text-[9px] text-muted-foreground font-mono">{idx2+1}</span>
                   <span className="text-lg">{BUILDING_ICONS[btype]}</span>
-                  <span className="text-[9px] font-mono text-muted-foreground">{count > 0 ? `${count}x · ` : ""}{cc}💰</span>
+                  <span className="text-[9px] font-mono text-muted-foreground">{count>0?`${count}x · `:""}{cost}</span>
                 </button>
               );
             })}
-            {hasSilo && (["atom", "hydrogen", "dirty"] as BombType[]).map(bt => {
-              const cost = BOMB_COST[bt]; const isActive = bombMode === bt;
-              const icons: Record<BombType, string> = { atom: "☢", hydrogen: "💥", dirty: "☣" };
+            {hasSilo && (["atom","hydrogen","dirty"] as BombType[]).map(bt => {
+              const cost=BOMB_COST[bt]; const isActive=bombMode===bt;
+              const icons: Record<BombType,string> = { atom:"☢", hydrogen:"💥", dirty:"☣" };
               return (
-                <button key={bt} title={`${bt} bomb — ${cost}💰`} disabled={!me || (me.coins || 0) < cost}
+                <button key={bt} title={`${bt} bomb — ${cost} balance`} disabled={myBal < cost}
                   onClick={() => {
-                    if (isActive) { setBombMode(null); bombModeRef.current = null; return; }
-                    setBombMode(bt); bombModeRef.current = bt;
-                    setPlaceMode(null); placeModeRef.current = null;
+                    if (isActive) { setBombMode(null); bombModeRef.current=null; return; }
+                    setBombMode(bt); bombModeRef.current=bt;
+                    setPlaceMode(null); placeModeRef.current=null;
                   }}
-                  className={`flex flex-col items-center justify-center w-14 h-14 rounded border transition-all ${isActive ? "border-red-400 bg-red-400/20" : "border-red-800/60 bg-background/60 hover:bg-red-900/30"} disabled:opacity-35 disabled:cursor-not-allowed`}>
+                  className={`flex flex-col items-center justify-center w-14 h-14 rounded border transition-all ${isActive?"border-red-400 bg-red-400/20":"border-red-800/60 bg-background/60 hover:bg-red-900/30"} disabled:opacity-35 disabled:cursor-not-allowed`}>
                   <span className="text-lg">{icons[bt]}</span>
-                  <span className="text-[9px] font-mono text-red-400">{cost}💰</span>
+                  <span className="text-[9px] font-mono text-red-400">{cost}</span>
                 </button>
               );
             })}
@@ -1243,71 +1296,43 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
           <div className="flex items-center gap-3 rounded-xl border border-border/60 bg-card/90 px-4 py-2 backdrop-blur-md shadow-lg">
             {me && (
               <div className="flex items-center gap-2 text-xs">
-                <span className="h-3 w-3 rounded-sm flex-shrink-0" style={{ backgroundColor: me.color }} />
+                <span className="h-3 w-3 rounded-sm flex-shrink-0" style={{ backgroundColor:me.color }} />
                 <div className="flex flex-col">
                   <span className="font-bold leading-none">{me.name}</span>
-                  <span className="font-mono text-muted-foreground text-[10px]">⚔{fmt(me.units)} · 💰{fmt(me.coins || 0)} · {me.pixels}t</span>
+                  <span className={`font-mono text-[10px] ${atSoftCap?"text-red-400":"text-muted-foreground"}`}>
+                    {fmt(myBal)} balance · {myPixels}t
+                  </span>
                 </div>
               </div>
             )}
             <div className="h-8 w-px bg-border" />
 
-            {/* Unit type */}
-            <div className="flex flex-col items-center gap-0.5">
-              <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Unit [Q/E/R]</span>
-              <div className="flex gap-1">
-                {(["infantry", "tank", "warship"] as UnitType[]).map((ut, ki) => {
-                  const icons: Record<UnitType, string> = { infantry: "🪖", tank: "🚜", warship: "🚢" };
-                  const keys = ["Q", "E", "R"];
-                  const cost = UNIT_COST[ut];
-                  return (
-                    <button key={ut} title={`[${keys[ki]}] ${ut}${cost ? ` — ${cost}💰/attack` : ""} — ${UNIT_MULT[ut]}× power`}
-                      onClick={() => { setUnitType(ut); unitTypeRef.current = ut; }}
-                      className={`flex flex-col items-center justify-center w-9 h-9 rounded border text-sm transition-all relative ${unitType === ut ? "border-primary bg-primary/20" : "border-border/60 bg-background/60 hover:bg-secondary/80"}`}>
-                      <span className="absolute top-0 left-0.5 text-[8px] text-muted-foreground">{keys[ki]}</span>
-                      {icons[ut]}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-            <div className="h-8 w-px bg-border" />
-
-            {/* Deploy % slider — this actually controls attack speed now */}
+            {/* THE slider — attack % (like territorial.io) */}
             <div className="flex flex-col items-center gap-0.5">
               <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
-                Deploy % <span className="text-primary">{deployPct}%</span>
+                Attack <span className="text-primary">{attackPct}%</span>
               </span>
               <div className="flex items-center gap-1.5">
-                <span className="text-[9px] text-muted-foreground">slow</span>
-                <input type="range" min={5} max={100} step={5} value={deployPct}
-                  onChange={e => { setDeployPct(+e.target.value); deployPctRef.current = +e.target.value; }}
-                  className="w-24 accent-primary" />
-                <span className="text-[9px] text-muted-foreground">fast</span>
+                <span className="text-[9px] text-muted-foreground">safe</span>
+                <input type="range" min={5} max={100} step={5} value={attackPct}
+                  onChange={e => { setAttackPct(+e.target.value); attackPctRef.current=+e.target.value; }}
+                  className="w-28 accent-primary" />
+                <span className="text-[9px] text-muted-foreground">all-in</span>
               </div>
               <span className="text-[9px] text-muted-foreground/60">
-                {Math.round((me?.units ?? 0) * deployPct / 100)} units on front
+                {fmt(myBal * attackPct / 100)} on border · {fmt(myBal * (1-attackPct/100))} held
               </span>
             </div>
             <div className="h-8 w-px bg-border" />
 
-            {/* Camera buttons */}
+            {/* Camera */}
             <div className="flex gap-1">
               {[
-                { title: "Zoom in", label: "+", fn: () => { const c = camRef.current; c.zoom = Math.min(10, c.zoom * 1.25); } },
-                { title: "Zoom out", label: "−", fn: () => { const c = camRef.current; c.zoom = Math.max(0.3, c.zoom * 0.8); } },
-                { title: "Reset view", label: "⌂", fn: () => { camRef.current = { x: 0, y: 0, zoom: 1 }; } },
-                { title: "Center on me [C]", label: "C", fn: () => {
-                    const myIdx2 = playerIndexRef.current.get(playerId); if (myIdx2 === undefined) return;
-                    const gr = ownerGridRef.current; let sx = 0, sy = 0, cnt = 0;
-                    for (let i = 0; i < gr.length; i++) if (gr[i] === myIdx2) { sx += i % GRID_W; sy += Math.floor(i / GRID_W); cnt++; }
-                    if (cnt === 0) return;
-                    const mr2 = mapRectRef.current; const cv = canvasRef.current;
-                    const wx = mr2.x + (sx / cnt / GRID_W) * mr2.w, wy = mr2.y + (sy / cnt / GRID_H) * mr2.h;
-                    camRef.current.x = (cv?.width ?? 0) / 2 - wx * camRef.current.zoom;
-                    camRef.current.y = (cv?.height ?? 0) / 2 - wy * camRef.current.zoom;
-                  }},
-              ].map(b => (
+                { label:"+", title:"Zoom in",   fn:()=>{ const c=camRef.current; c.zoom=Math.min(12,c.zoom*1.25); } },
+                { label:"−", title:"Zoom out",  fn:()=>{ const c=camRef.current; c.zoom=Math.max(0.25,c.zoom*0.8); } },
+                { label:"⌂", title:"Reset view",fn:()=>{ camRef.current={x:0,y:0,zoom:1}; } },
+                { label:"C", title:"Center [C]", fn:centerCamera },
+              ].map(b=>(
                 <button key={b.label} title={b.title} onClick={b.fn}
                   className="flex h-7 w-7 items-center justify-center rounded border border-border bg-background/60 text-sm hover:bg-secondary">
                   {b.label}
@@ -1316,9 +1341,9 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
             </div>
             <div className="h-8 w-px bg-border" />
             <div className="text-[9px] text-muted-foreground leading-tight">
-              <div>WASD/Arrows: pan</div>
-              <div>Esc: cancel attack</div>
-              <div>1-8: buildings</div>
+              <div>WASD: pan · scroll: zoom</div>
+              <div>Click territory to attack</div>
+              <div>Right-click / Esc: cancel</div>
             </div>
           </div>
         </div>
