@@ -28,13 +28,16 @@ export function App() {
   const [lobby, setLobby] = useState<Lobby | null>(null);
 
   useEffect(() => {
+    if (typeof window === "undefined") return;
     setPlayerId(getOrCreatePlayerId());
-    setUsername(localStorage.getItem(NAME_KEY) ?? "");
+    setUsername(window.localStorage.getItem(NAME_KEY) ?? "");
   }, []);
 
   useEffect(() => {
-    if (username) localStorage.setItem(NAME_KEY, username);
+    if (typeof window === "undefined") return;
+    if (username) window.localStorage.setItem(NAME_KEY, username);
   }, [username]);
+
 
 
   async function joinLobbyAsPlayer(lob: Lobby) {
