@@ -1096,6 +1096,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
               <span className="w-3 text-right text-muted-foreground">{i + 1}</span>
               <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: p.color }} />
               <span className="flex-1 truncate font-medium">{p.name}</span>
+              {allies.includes(p.player_id) && <Handshake className="h-3 w-3 text-cyan-300" />}
               <span className="font-mono text-muted-foreground">{p.pixels}</span>
             </div>
           ))}
