@@ -4,7 +4,7 @@ import { GRID_W, GRID_H } from "@/game/constants";
 import { loadLandMask } from "@/game/landMask";
 import worldMap from "@/assets/map-world.jpg";
 import { Button } from "@/components/ui/button";
-import { LogOut } from "lucide-react";
+import { LogOut, X, Swords, Handshake, ArrowLeftRight, MessageSquare } from "lucide-react";
 import { toast } from "sonner";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -26,39 +26,71 @@ type Building = { type: BuildingType; ownerIdx: number; gridIdx: number };
 type BombType = "atom" | "hydrogen" | "dirty";
 type UnitType = "infantry" | "tank" | "warship";
 
-// Attack target — player right-clicked an enemy, border expands toward them
-// This is persistent (not draining) — it biases the spread direction until cancelled or new target set
-type AttackTarget = {
+// A squad of troops marching toward a target grid cell
+type Squad = {
+  id: string;
   ownerIdx: number;
-  targetIdx: number;  // grid cell being attacked toward
+  ownerPid: string;
   unitType: UnitType;
+  unitsStart: number;
+  unitsCurrent: number;        // decreases as they fight
+  targetGridIdx: number;
+  targetName?: string;         // name of target player/territory
+  progress: number;            // 0–1 march progress
+  isNaval: boolean;
+  fromGridIdx: number;         // spawn cell
+  screenFromX: number;
+  screenFromY: number;
+  screenToX: number;
+  screenToY: number;
 };
 
 type Ship = {
   id: string; ownerIdx: number;
   fromX: number; fromY: number; toX: number; toY: number;
   units: number; targetGridIdx: number; progress: number;
-  distanceTiles: number; // actual manhattan distance for speed calc
+  distanceTiles: number;
 };
 
 type RadZone = { gridIdx: number; strength: number; decay: number };
-
 type PlaceMode = { type: BuildingType } | null;
 type Particle = { x: number; y: number; vx: number; vy: number; life: number; color: string };
 
+// Right-click context menu
+type ContextMenu = {
+  x: number; y: number;
+  targetPlayerIdx: number;
+  targetPlayerPid: string;
+  targetName: string;
+};
+
+// Hover panel data
+type HoverPanel = {
+  playerIdx: number;
+  pid: string;
+  name: string;
+  color: string;
+  units: number;
+  coins: number;
+  pixels: number;
+  isBot: boolean;
+  buildings: Building[];
+  attackingTroops: number;
+};
+
 // ─── Constants ───────────────────────────────────────────────────────────────
 const DIFFICULTY_REGEN: Record<string, number> = { relaxed: 0.6, balanced: 1.0, intense: 1.5 };
-
-// Pressure simulation — OpenFront style: slow organic border growth
-// Tiles spread one at a time from your border, directed toward your attack target
-const PASSIVE_SPREAD_CHANCE = 0.003;  // per-border-tile per tick, no target
-const ATTACK_SPREAD_CHANCE  = 0.018;  // per-border-tile per tick, toward target
 const FORT_DEFENSE   = 3.0;
 const DEFPOST_MULT   = 1.8;
 const MAX_STRENGTH   = 100;
 const REGEN_RATE     = 0.3;
 
-// Unit multipliers on spread chance
+// Squad march speed — cells per second
+const SQUAD_CELLS_PER_SEC = 8;
+// Attrition per contested cell (fraction of squad lost)
+const ATTRITION_NEUTRAL   = 0.002;  // very low for empty land
+const ATTRITION_ENEMY     = 0.012;  // heavier vs defended tiles
+
 const UNIT_MULT: Record<UnitType, number> = { infantry: 1.0, tank: 2.5, warship: 1.5 };
 const UNIT_COST: Record<UnitType, number> = { infantry: 0, tank: 80, warship: 60 };
 
@@ -66,14 +98,22 @@ const FACTORY_UNITS  = 8;
 const PORT_COINS     = 3;
 const CITY_COINS     = 2;
 const CITY_POP_CAP   = 500;
-const STARTER_RADIUS = 2;   // tiny spawn — just a few cells
-
-// Ship speed: tiles per ms (we'll compute actual travel time from distance)
-const SHIP_TILES_PER_MS = 0.004; // ~250ms per tile — feels like it's crossing ocean
+const STARTER_RADIUS = 2;
+const SHIP_TILES_PER_MS = 0.004;
 
 const BUILD_COST: Record<BuildingType, [number, number]> = {
   city: [80, 0], defense_post: [30, 20], port: [60, 0], fort: [40, 40],
   factory: [70, 0], missile_silo: [200, 0], sam_launcher: [90, 0], naval_base: [120, 0],
+};
+const BUILD_STAT: Record<BuildingType, string> = {
+  city:          "+2💰/tick · +500 pop cap",
+  defense_post:  "1.8× tile defense · checker pattern",
+  port:          "+3💰/tick · enables naval attacks",
+  fort:          "3× tile defense · coastal fortress",
+  factory:       "+8 units/tick per factory",
+  missile_silo:  "Enables nuclear & dirty bombs",
+  sam_launcher:  "40% chance to intercept missiles",
+  naval_base:    "1.7× ship speed",
 };
 const BOMB_COST:   Record<BombType, number> = { atom: 600, hydrogen: 1200, dirty: 400 };
 const BOMB_RADIUS: Record<BombType, number> = { atom: 12, hydrogen: 22, dirty: 8 };
@@ -87,6 +127,7 @@ const BUILDING_ICONS: Record<BuildingType, string> = {
   city: "🏙", defense_post: "🛡", port: "⚓", fort: "🔶",
   factory: "🏭", missile_silo: "🚀", sam_launcher: "📡", naval_base: "🛳",
 };
+const TOOLBAR: BuildingType[] = ["city", "factory", "port", "naval_base", "defense_post", "fort", "missile_silo", "sam_launcher"];
 
 function hexRgb(hex: string): [number, number, number] {
   const c = hex.replace("#", "");
@@ -111,7 +152,9 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
   const [isDead,       setIsDead]       = useState(false);
   const [isSpectating, setIsSpectating] = useState(false);
   const [unitType,     setUnitType]     = useState<UnitType>("infantry");
-  const [attackTarget, setAttackTarget] = useState<{ name: string } | null>(null); // just for UI display
+  const [mySquads,     setMySquads]     = useState<Squad[]>([]);
+  const [hoverPanel,   setHoverPanel]   = useState<HoverPanel | null>(null);
+  const [contextMenu,  setContextMenu]  = useState<ContextMenu | null>(null);
 
   const sendPctRef    = useRef(20);
   const buildingsRef  = useRef<Building[]>([]);
@@ -119,6 +162,8 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
   const bombModeRef   = useRef<BombType | null>(null);
   const unitTypeRef   = useRef<UnitType>("infantry");
   const keysRef       = useRef<Set<string>>(new Set());
+  const squadsRef     = useRef<Squad[]>([]);
+  const hoverGridRef  = useRef<number>(-1);
 
   useEffect(() => { sendPctRef.current  = sendPct;  }, [sendPct]);
   useEffect(() => { buildingsRef.current = buildings; }, [buildings]);
@@ -133,10 +178,6 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
   const coastMaskRef    = useRef<Uint8Array | null>(null);
   const radZonesRef     = useRef<RadZone[]>([]);
   const shipsRef        = useRef<Ship[]>([]);
-  // My attack target — persistent directional bias (not a draining budget)
-  const myTargetRef     = useRef<AttackTarget | null>(null);
-  // Bot targets
-  const botTargetsRef   = useRef<Map<number, AttackTarget>>(new Map());
   const playersRef      = useRef<Map<string, LobbyPlayer>>(new Map());
   const playerIndexRef  = useRef<Map<string, number>>(new Map());
   const colorsRef       = useRef<[number, number, number][]>([]);
@@ -225,16 +266,18 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
           setBuildings(prev => [...prev, b]);
         }
       })
-      .on("broadcast", { event: "target" }, ({ payload }) => {
-        const t = payload as AttackTarget;
-        botTargetsRef.current.set(t.ownerIdx, t);
-      })
       .on("broadcast", { event: "rad_zone" }, ({ payload }) => {
         radZonesRef.current = [...radZonesRef.current, ...(payload as RadZone[])];
       })
       .on("broadcast", { event: "ship" }, ({ payload }) => {
         const s = payload as Ship;
         if (!shipsRef.current.find(x => x.id === s.id)) shipsRef.current = [...shipsRef.current, s];
+      })
+      .on("broadcast", { event: "squad" }, ({ payload }) => {
+        const s = payload as Squad;
+        if (!squadsRef.current.find(x => x.id === s.id)) {
+          squadsRef.current = [...squadsRef.current, s];
+        }
       })
       .subscribe();
     channelRef.current = ch;
@@ -276,152 +319,111 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     resize();
     const ro = new ResizeObserver(resize); ro.observe(container);
 
-    // ── Pressure simulation tick ──────────────────────────────────────────
-    // OpenFront-style: each tick, each border cell has a chance to flip an adjacent
-    // non-owned cell. The attack target biases WHICH direction is chosen.
-    // "Attack ratio" controls how many troops are consumed per flip = how fast you spread.
-    function tickPressure(dt: number) {
-      const mask = landMaskRef.current; if (!mask) return;
+    // ── Regen only (no passive spread) ───────────────────────────────────
+    function tickRegen(dt: number) {
       const grid = ownerGridRef.current;
       const str  = strengthGridRef.current;
-      const blds = buildingsRef.current;
-      const myTarget  = myTargetRef.current;
-      const botTargets = botTargetsRef.current;
-
-      // Regen: owned tiles fill toward MAX_STRENGTH
       const regenMult = DIFFICULTY_REGEN[lobby.difficulty] ?? 1;
       for (let i = 0; i < grid.length; i++) {
         if (grid[i] < 0) continue;
         str[i] = Math.min(MAX_STRENGTH, str[i] + REGEN_RATE * regenMult * dt * 0.06);
       }
+    }
 
-      // Build border-tile lists per player (only tiles adjacent to non-owned land)
-      // We'll collect all owned border tiles then process them
+    // ── Squad advancement ─────────────────────────────────────────────────
+    // Squads march cell by cell. Each step they contest/claim tiles along a path.
+    // They lose units based on tile defense.
+    function tickSquads(dt: number) {
+      const mask = landMaskRef.current; if (!mask) return;
+      const grid = ownerGridRef.current;
+      const str  = strengthGridRef.current;
+      const blds = buildingsRef.current;
+      const mr   = mapRectRef.current;
       const claims: { i: number; o: number; s: number }[] = [];
-      const mr  = mapRectRef.current;
-      const cam = camRef.current;
+      const dead: string[] = [];
 
-      // Shuffle order each tick so no directional bias from array order
-      const indices = Array.from({ length: grid.length }, (_, i) => i);
-      // Fisher-Yates partial shuffle (just randomize which we visit first)
-      for (let k = indices.length - 1; k > 0; k--) {
-        const j = Math.floor(Math.random() * (k + 1));
-        [indices[k], indices[j]] = [indices[j], indices[k]];
-      }
+      for (const squad of squadsRef.current) {
+        if (squad.unitsCurrent <= 0) { dead.push(squad.id); continue; }
 
-      const flipped = new Set<number>();
+        // Advance progress
+        const distCells = Math.abs(squad.targetGridIdx % GRID_W - squad.fromGridIdx % GRID_W) +
+                          Math.abs(Math.floor(squad.targetGridIdx / GRID_W) - Math.floor(squad.fromGridIdx / GRID_W));
+        const speed = SQUAD_CELLS_PER_SEC / Math.max(1, distCells) * (dt / 1000);
+        squad.progress = Math.min(1, squad.progress + speed);
 
-      for (const i of indices) {
-        const o = grid[i]; if (o < 0 || str[i] < 1) continue;
+        // Current grid cell the squad is AT
+        const fromX = squad.fromGridIdx % GRID_W, fromY = Math.floor(squad.fromGridIdx / GRID_W);
+        const toX   = squad.targetGridIdx % GRID_W, toY = Math.floor(squad.targetGridIdx / GRID_W);
+        const cx = Math.round(fromX + (toX - fromX) * squad.progress);
+        const cy = Math.round(fromY + (toY - fromY) * squad.progress);
+        const ci = cy * GRID_W + cx;
+        if (ci < 0 || ci >= grid.length || !mask[ci]) continue;
 
-        // Get this player's target
-        let target: AttackTarget | null = null;
-        if (myTarget && myTarget.ownerIdx === o) target = myTarget;
-        else if (botTargets.has(o)) target = botTargets.get(o)!;
+        const curOwner = grid[ci];
+        const uMult    = UNIT_MULT[squad.unitType];
 
-        const uMult = target ? UNIT_MULT[target.unitType] : 1.0;
-        const spreadChance = target ? ATTACK_SPREAD_CHANCE : PASSIVE_SPREAD_CHANCE;
+        if (curOwner !== squad.ownerIdx) {
+          const hasFort    = blds.some(b => b.gridIdx === ci && b.type === "fort");
+          const hasDefPost = blds.some(b => b.gridIdx === ci && b.type === "defense_post");
+          const defMult    = hasFort ? FORT_DEFENSE : hasDefPost ? DEFPOST_MULT : 1.0;
+          const isNeutral  = curOwner < 0;
+          const attrition  = (isNeutral ? ATTRITION_NEUTRAL : ATTRITION_ENEMY * defMult / uMult) * dt;
+          squad.unitsCurrent = Math.max(0, squad.unitsCurrent - attrition * squad.unitsStart);
 
-        const x = i % GRID_W, y = Math.floor(i / GRID_W);
+          // Flip tile if squad has enough strength
+          const attackPow = (squad.unitsCurrent / squad.unitsStart) * uMult * 50;
+          const defendPow = isNeutral ? 1 : str[ci] * defMult;
+          if (attackPow > defendPow || Math.random() < 0.03) {
+            const prevOwner = grid[ci];
+            grid[ci] = squad.ownerIdx;
+            str[ci]  = Math.max(5, attackPow - defendPow);
+            claims.push({ i: ci, o: squad.ownerIdx, s: str[ci] });
 
-        // Collect candidate neighbors
-        const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]] as const;
-        let candidates: { ni: number; dx: number; dy: number }[] = [];
-
-        for (const [dx, dy] of dirs) {
-          const nx = x + dx, ny = y + dy;
-          if (nx < 0 || ny < 0 || nx >= GRID_W || ny >= GRID_H) continue;
-          const ni = ny * GRID_W + nx;
-          if (!mask[ni]) continue;
-          if (grid[ni] === o) continue;
-          if (flipped.has(ni)) continue;
-          candidates.push({ ni, dx, dy });
-        }
-        if (candidates.length === 0) continue;
-
-        // Bias candidates toward target if set
-        if (target) {
-          const tx = target.targetIdx % GRID_W, ty = Math.floor(target.targetIdx / GRID_W);
-          const myDist = Math.abs(x - tx) + Math.abs(y - ty);
-          // Weight: dirs that reduce distance get PUSH_BOOST weight
-          const weighted: { ni: number }[] = [];
-          for (const c of candidates) {
-            const ndist = Math.abs((x + c.dx) - tx) + Math.abs((y + c.dy) - ty);
-            const w = ndist < myDist ? 6 : 1; // 6x more likely to go toward target
-            for (let w2 = 0; w2 < w; w2++) weighted.push(c);
-          }
-          candidates = weighted;
-        }
-
-        // Roll spread chance (scaled by dt and unit multiplier)
-        const roll = Math.random();
-        if (roll > spreadChance * uMult * (dt / 16.67)) continue;
-
-        // Pick random candidate (already weighted toward target)
-        const chosen = candidates[Math.floor(Math.random() * candidates.length)];
-        const ni = chosen.ni;
-        const no = grid[ni];
-
-        const hasFort    = blds.some(b => b.gridIdx === ni && b.type === "fort");
-        const hasDefPost = blds.some(b => b.gridIdx === ni && b.type === "defense_post");
-        const defMult    = hasFort ? FORT_DEFENSE : hasDefPost ? DEFPOST_MULT : 1.0;
-
-        if (no < 0) {
-          // Claim neutral tile — always succeeds
-          grid[ni] = o;
-          str[ni]  = Math.max(1, str[i] * 0.4);
-          flipped.add(ni);
-          claims.push({ i: ni, o, s: str[ni] });
-
-          // Particle
-          const wx2 = mr.x + ((ni % GRID_W) + 0.5) / GRID_W * mr.w;
-          const wy2 = mr.y + (Math.floor(ni / GRID_W) + 0.5) / GRID_H * mr.h;
-          const col2 = colorsRef.current[o] ? `rgb(${colorsRef.current[o].join(",")})` : "#fff";
-          particlesRef.current.push({ x: cam.x + wx2 * cam.zoom, y: cam.y + wy2 * cam.zoom, vx: (Math.random() - 0.5) * 0.5, vy: (Math.random() - 0.5) * 0.5, life: 0.8, color: col2 });
-        } else {
-          // Contest enemy tile — compare strengths
-          const attackPow = str[i] * 0.15 * uMult;
-          const defendPow = str[ni] * 0.15 * defMult;
-          if (attackPow > defendPow || Math.random() < 0.05) {
-            // Win: flip tile
-            grid[ni] = o;
-            str[ni]  = Math.max(1, attackPow - defendPow);
-            flipped.add(ni);
-            claims.push({ i: ni, o, s: str[ni] });
-
-            const wx2 = mr.x + ((ni % GRID_W) + 0.5) / GRID_W * mr.w;
-            const wy2 = mr.y + (Math.floor(ni / GRID_W) + 0.5) / GRID_H * mr.h;
-            const col2 = colorsRef.current[o] ? `rgb(${colorsRef.current[o].join(",")})` : "#fff";
-            for (let pi = 0; pi < 3; pi++) {
-              particlesRef.current.push({ x: cam.x + wx2 * cam.zoom, y: cam.y + wy2 * cam.zoom, vx: (Math.random() - 0.5) * 1.2, vy: (Math.random() - 0.5) * 1.2, life: 1, color: col2 });
+            // Explosion particles
+            const wx = mr.x + (cx + 0.5) / GRID_W * mr.w;
+            const wy = mr.y + (cy + 0.5) / GRID_H * mr.h;
+            const cam = camRef.current;
+            const col = colorsRef.current[squad.ownerIdx];
+            const colStr = col ? `rgb(${col.join(",")})` : "#fff";
+            for (let pi = 0; pi < (isNeutral ? 1 : 3); pi++) {
+              particlesRef.current.push({ x: cam.x + wx * cam.zoom, y: cam.y + wy * cam.zoom, vx: (Math.random() - 0.5) * 1.5, vy: (Math.random() - 0.5) * 1.5, life: 1, color: colStr });
             }
 
             // Check elimination
-            const prevOwner = no;
-            if (!eliminatedRef.current.has(prevOwner)) {
+            if (!isNeutral && prevOwner >= 0 && !eliminatedRef.current.has(prevOwner)) {
               let survived = false;
               for (let k = 0; k < grid.length; k++) if (grid[k] === prevOwner) { survived = true; break; }
               if (!survived) {
                 eliminatedRef.current.add(prevOwner);
-                const killerPid = [...playerIndexRef.current.entries()].find(([, v]) => v === o)?.[0];
-                if (killerPid) {
-                  const killer = playersRef.current.get(killerPid);
-                  if (killer) {
-                    killer.coins = (killer.coins || 0) + 500;
-                    supabase.from("lobby_players").update({ coins: killer.coins }).eq("lobby_id", lobby.id).eq("player_id", killerPid);
-                    if (killerPid === playerId) notify("Enemy eliminated! +500 coins", "success");
+                const col2 = colorsRef.current[squad.ownerIdx];
+                if (col2) {
+                  const killerPid = [...playerIndexRef.current.entries()].find(([, v]) => v === squad.ownerIdx)?.[0];
+                  if (killerPid) {
+                    const killer = playersRef.current.get(killerPid);
+                    if (killer) {
+                      killer.coins = (killer.coins || 0) + 500;
+                      supabase.from("lobby_players").update({ coins: killer.coins }).eq("lobby_id", lobby.id).eq("player_id", killerPid);
+                      if (killerPid === playerId) notify("Enemy eliminated! +500 coins", "success");
+                    }
                   }
                 }
                 const myIdx = playerIndexRef.current.get(playerId);
                 if (prevOwner === myIdx) setIsDead(true);
               }
             }
+            blds.forEach(b => { if (b.gridIdx === ci && squad.ownerIdx >= 0) b.ownerIdx = squad.ownerIdx; });
+          }
+        }
 
-            // Transfer building
-            blds.forEach(b => { if (b.gridIdx === ni && o >= 0) b.ownerIdx = o; });
-          } else {
-            // Lose: attacker tile weakens slightly
-            str[i] = Math.max(0, str[i] - defendPow * 0.05);
+        // Squad reached target
+        if (squad.progress >= 1) {
+          dead.push(squad.id);
+          // Return surviving units to player
+          const ownerPid = squad.ownerPid;
+          const p = playersRef.current.get(ownerPid);
+          if (p) {
+            p.units = Math.min(99999, p.units + Math.floor(squad.unitsCurrent));
+            supabase.from("lobby_players").update({ units: p.units }).eq("lobby_id", lobby.id).eq("player_id", ownerPid);
           }
         }
       }
@@ -430,6 +432,14 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         for (let ci = 0; ci < claims.length; ci += 60) {
           channelRef.current?.send({ type: "broadcast", event: "claim", payload: claims.slice(ci, ci + 60) });
         }
+      }
+
+      if (dead.length > 0) {
+        squadsRef.current = squadsRef.current.filter(s => !dead.includes(s.id));
+        setMySquads(squadsRef.current.filter(s => s.ownerPid === playerId));
+      } else {
+        // Update my squads display
+        setMySquads([...squadsRef.current.filter(s => s.ownerPid === playerId)]);
       }
     }
 
@@ -562,20 +572,32 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         ctx.strokeRect(mx + x * cellW + 0.5, my + y * cellH + 0.5, cellW - 1, cellH - 1);
       }
 
-      // Attack target indicator — small pulsing dot on target, NO big circle
-      const myTarget = myTargetRef.current;
-      if (myTarget) {
-        const ptx = mx + (myTarget.targetIdx % GRID_W + 0.5) * cellW;
-        const pty = my + (Math.floor(myTarget.targetIdx / GRID_W) + 0.5) * cellH;
-        const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 200);
+      // Squads — draw marching icons on the map
+      for (const squad of squadsRef.current) {
+        const fromX = squad.fromGridIdx % GRID_W, fromY = Math.floor(squad.fromGridIdx / GRID_W);
+        const toX   = squad.targetGridIdx % GRID_W, toY = Math.floor(squad.targetGridIdx / GRID_W);
+        const cx2 = fromX + (toX - fromX) * squad.progress;
+        const cy2 = fromY + (toY - fromY) * squad.progress;
+        const sx = mx + (cx2 + 0.5) * cellW, sy = my + (cy2 + 0.5) * cellH;
+        const col = colorsRef.current[squad.ownerIdx];
+        const colStr = col ? `rgb(${col.join(",")})` : "#fff";
+        const healthPct = squad.unitsCurrent / squad.unitsStart;
+        const icons: Record<UnitType, string> = { infantry: "🪖", tank: "🚜", warship: "🚢" };
+
         ctx.save();
-        // Small cross-hair style target marker
-        ctx.strokeStyle = `rgba(255,255,100,${0.6 + pulse * 0.4})`;
-        ctx.lineWidth = 1.5;
-        ctx.beginPath();
-        ctx.moveTo(ptx - cellW * 2, pty); ctx.lineTo(ptx + cellW * 2, pty);
-        ctx.moveTo(ptx, pty - cellH * 2); ctx.lineTo(ptx, pty + cellH * 2);
-        ctx.stroke();
+        // Shadow circle
+        ctx.globalAlpha = 0.5;
+        ctx.fillStyle = colStr;
+        ctx.beginPath(); ctx.arc(sx, sy, 7, 0, Math.PI * 2); ctx.fill();
+        // Icon
+        ctx.globalAlpha = 1;
+        ctx.font = `${Math.max(7, 10)}px serif`; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+        ctx.fillText(icons[squad.unitType], sx, sy);
+        // Health bar below icon
+        const barW = 16, barH = 3, barX = sx - barW / 2, barY = sy + 9;
+        ctx.fillStyle = "rgba(0,0,0,0.6)"; ctx.fillRect(barX - 1, barY - 1, barW + 2, barH + 2);
+        ctx.fillStyle = healthPct > 0.5 ? "#22c55e" : healthPct > 0.25 ? "#f59e0b" : "#ef4444";
+        ctx.fillRect(barX, barY, barW * healthPct, barH);
         ctx.restore();
       }
 
@@ -587,7 +609,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         drawBldIcon(mx + (b.gridIdx % GRID_W) / GRID_W * mw + cellW / 2, my + Math.floor(b.gridIdx / GRID_W) / GRID_H * mh + cellH / 2, b.type, col, cam.zoom);
       });
 
-      // Ships — draw as a boat icon traveling across ocean
+      // Ships
       shipsRef.current.forEach(ship => {
         const sx = ship.fromX + (ship.toX - ship.fromX) * ship.progress;
         const sy = ship.fromY + (ship.toY - ship.fromY) * ship.progress;
@@ -596,16 +618,13 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         const angle = Math.atan2(ship.toY - ship.fromY, ship.toX - ship.fromX);
         ctx.save();
         ctx.translate(sx, sy); ctx.rotate(angle);
-        // Hull
         ctx.fillStyle = col; ctx.strokeStyle = "rgba(255,255,255,0.8)"; ctx.lineWidth = 0.8;
         ctx.beginPath(); ctx.ellipse(0, 0, 7, 3.5, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
-        // Wake lines behind
         ctx.globalAlpha = 0.25; ctx.strokeStyle = "#aef"; ctx.lineWidth = 1.2;
         ctx.beginPath(); ctx.moveTo(-9, 2); ctx.lineTo(-18, 4); ctx.moveTo(-9, -2); ctx.lineTo(-18, -4); ctx.stroke();
         ctx.restore();
-        // Troop count above ship
         ctx.save();
-        ctx.fillStyle = "#fff"; ctx.font = `bold ${Math.max(7, 9 * cam.zoom)}px monospace`;
+        ctx.fillStyle = "#fff"; ctx.font = `bold ${Math.max(7, 9)}px monospace`;
         ctx.textAlign = "center"; ctx.textBaseline = "middle";
         ctx.shadowColor = "rgba(0,0,0,0.9)"; ctx.shadowBlur = 3;
         ctx.fillText(`${ship.units}`, sx, sy - 11); ctx.restore();
@@ -664,31 +683,26 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
       if (ks.has("a") || ks.has("arrowleft"))  cam.x += 5;
       if (ks.has("d") || ks.has("arrowright")) cam.x -= 5;
 
-      tickPressure(dt);
+      tickRegen(dt);
+      tickSquads(dt);
 
-      // Ships — move at speed proportional to actual tile distance
+      // Ships
       const navalBoost = new Set(buildingsRef.current.filter(b => b.type === "naval_base").map(b => b.ownerIdx));
       shipsRef.current = shipsRef.current.filter(ship => {
         const speed = SHIP_TILES_PER_MS / Math.max(1, ship.distanceTiles) * (navalBoost.has(ship.ownerIdx) ? 1.7 : 1);
         ship.progress = Math.min(1, ship.progress + speed * dt);
         if (ship.progress >= 1) {
-          // Land troops ONLY on coastline tiles near target
           const mask2 = landMaskRef.current; const coast2 = coastMaskRef.current;
           if (mask2 && coast2) {
             const gr = ownerGridRef.current, st = strengthGridRef.current;
             const ltx = ship.targetGridIdx % GRID_W, lty = Math.floor(ship.targetGridIdx / GRID_W);
-            // Seed only coastal tiles in landing radius
             for (let dy = -4; dy <= 4; dy++) for (let dx = -4; dx <= 4; dx++) {
               if (Math.abs(dx) + Math.abs(dy) > 4) continue;
               const nx = ltx + dx, ny = lty + dy;
               if (nx < 0 || ny < 0 || nx >= GRID_W || ny >= GRID_H) continue;
               const ni = ny * GRID_W + nx;
-              // Only land on coastal or land tiles (not deep ocean), don't overwrite own tiles
               if (!mask2[ni]) continue;
-              if (gr[ni] !== ship.ownerIdx) {
-                gr[ni] = ship.ownerIdx;
-                st[ni] = Math.min(MAX_STRENGTH, Math.max(5, ship.units * 0.15));
-              }
+              if (gr[ni] !== ship.ownerIdx) { gr[ni] = ship.ownerIdx; st[ni] = Math.min(MAX_STRENGTH, Math.max(5, ship.units * 0.15)); }
             }
           }
           return false;
@@ -707,7 +721,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
 
       if (now - lastSyncRef.current > 1500) { lastSyncRef.current = now; syncStats(); }
 
-      // Bot AI
+      // Bot AI (simple — bots still use old spread, keeping them functional)
       if (lobby.host_id === playerId && now - lastBotRef.current > 2200) {
         lastBotRef.current = now;
         const mask2 = landMaskRef.current; if (mask2) {
@@ -724,23 +738,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
               if (cands.length === 0) return;
               plantStarter(cands[Math.floor(Math.random() * cands.length)], idx); return;
             }
-            // Build
-            const coins = bot.coins || 0;
-            if (coins > 80 && buildingsRef.current.filter(b => b.ownerIdx === idx).length < 5) {
-              const free = owned.filter(k => !buildingsRef.current.some(b => b.gridIdx === k));
-              if (free.length > 0) {
-                const pick = free[Math.floor(Math.random() * free.length)];
-                const btype: BuildingType = coins > 200 ? "factory" : coins > 120 ? "defense_post" : "city";
-                const [cc] = BUILD_COST[btype];
-                if (coins >= cc) {
-                  const bld: Building = { type: btype, ownerIdx: idx, gridIdx: pick };
-                  buildingsRef.current = [...buildingsRef.current, bld]; setBuildings(prev => [...prev, bld]);
-                  channelRef.current?.send({ type: "broadcast", event: "building", payload: bld });
-                  bot.coins = (bot.coins || 0) - cc;
-                }
-              }
-            }
-            if (bot.units < 20) return;
+            if (bot.units < 30) return;
             const neutral: number[] = [], enemy: number[] = [];
             for (const i of owned) {
               const x2 = i % GRID_W, y2 = Math.floor(i / GRID_W);
@@ -755,9 +753,24 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
             if (neutral.length > 0 && bot.units > 30) target = neutral[Math.floor(Math.random() * neutral.length)];
             else if (enemy.length > 0 && bot.units > 100) target = enemy[Math.floor(Math.random() * enemy.length)];
             if (target === -1) return;
-            const bt: AttackTarget = { ownerIdx: idx, targetIdx: target, unitType: "infantry" };
-            botTargetsRef.current.set(idx, bt);
-            channelRef.current?.send({ type: "broadcast", event: "target", payload: bt });
+            // Bot launches a squad
+            const border = owned.reduce((best, i) => {
+              const d = Math.abs(i % GRID_W - target % GRID_W) + Math.abs(Math.floor(i / GRID_W) - Math.floor(target / GRID_W));
+              return d < best.d ? { i, d } : best;
+            }, { i: owned[0], d: Infinity });
+            const sendUnits = Math.max(5, Math.floor(bot.units * 0.2));
+            const mr2 = mapRectRef.current;
+            const botSquad: Squad = {
+              id: crypto.randomUUID(), ownerIdx: idx, ownerPid: bot.player_id,
+              unitType: "infantry", unitsStart: sendUnits, unitsCurrent: sendUnits,
+              targetGridIdx: target, progress: 0, isNaval: false, fromGridIdx: border.i,
+              screenFromX: mr2.x + (border.i % GRID_W + 0.5) / GRID_W * mr2.w,
+              screenFromY: mr2.y + (Math.floor(border.i / GRID_W) + 0.5) / GRID_H * mr2.h,
+              screenToX: mr2.x + (target % GRID_W + 0.5) / GRID_W * mr2.w,
+              screenToY: mr2.y + (Math.floor(target / GRID_W) + 0.5) / GRID_H * mr2.h,
+            };
+            squadsRef.current = [...squadsRef.current, botSquad];
+            bot.units = Math.max(0, bot.units - sendUnits);
           });
         }
       }
@@ -783,21 +796,62 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
       }
     }
     function onMouseMove(e: MouseEvent) {
-      if (!dragRef.current.active) return;
-      const dx = (e.clientX - dragRef.current.startX) * devicePixelRatio;
-      const dy = (e.clientY - dragRef.current.startY) * devicePixelRatio;
-      if (Math.abs(dx) > 3 || Math.abs(dy) > 3) dragMovedRef.current = true;
-      camRef.current.x = dragRef.current.camX + dx; camRef.current.y = dragRef.current.camY + dy;
+      if (dragRef.current.active) {
+        const dx = (e.clientX - dragRef.current.startX) * devicePixelRatio;
+        const dy = (e.clientY - dragRef.current.startY) * devicePixelRatio;
+        if (Math.abs(dx) > 3 || Math.abs(dy) > 3) dragMovedRef.current = true;
+        camRef.current.x = dragRef.current.camX + dx; camRef.current.y = dragRef.current.camY + dy;
+      }
+
+      // Hover panel
+      const rect = canvas!.getBoundingClientRect();
+      const px = (e.clientX - rect.left) * devicePixelRatio;
+      const py = (e.clientY - rect.top) * devicePixelRatio;
+      const cam = camRef.current;
+      const wx = (px - cam.x) / cam.zoom, wy = (py - cam.y) / cam.zoom;
+      const mr2 = mapRectRef.current;
+      const gx = Math.floor((wx - mr2.x) / (mr2.w / GRID_W));
+      const gy = Math.floor((wy - mr2.y) / (mr2.h / GRID_H));
+      if (gx >= 0 && gy >= 0 && gx < GRID_W && gy < GRID_H) {
+        const gi = gy * GRID_W + gx;
+        if (gi !== hoverGridRef.current) {
+          hoverGridRef.current = gi;
+          const ownerIdx = ownerGridRef.current[gi];
+          if (ownerIdx >= 0) {
+            const entry = [...playerIndexRef.current.entries()].find(([, v]) => v === ownerIdx);
+            if (entry) {
+              const [pid] = entry;
+              const p = playersRef.current.get(pid);
+              if (p) {
+                const myPid = playerId;
+                const myIdx2 = playerIndexRef.current.get(myPid);
+                const attackingTroops = squadsRef.current
+                  .filter(s => s.ownerIdx === myIdx2 && ownerIdx !== myIdx2)
+                  .reduce((sum, s) => sum + s.unitsCurrent, 0);
+                setHoverPanel({
+                  playerIdx: ownerIdx, pid, name: p.name, color: p.color,
+                  units: p.units, coins: p.coins || 0, pixels: p.pixels,
+                  isBot: p.is_bot,
+                  buildings: buildingsRef.current.filter(b => b.ownerIdx === ownerIdx),
+                  attackingTroops: Math.floor(attackingTroops),
+                });
+              }
+            }
+          } else {
+            setHoverPanel(null);
+          }
+        }
+      } else {
+        if (hoverGridRef.current !== -1) { hoverGridRef.current = -1; setHoverPanel(null); }
+      }
     }
     function onMouseUp() { dragRef.current.active = false; }
     function onKeyDown(e: KeyboardEvent) {
       keysRef.current.add(e.key.toLowerCase());
-      // Shortcuts
       if (e.key === "c" || e.key === "C") {
-        // Center on own territory
-        const myIdx = playerIndexRef.current.get(playerId); if (myIdx === undefined) return;
+        const myIdx2 = playerIndexRef.current.get(playerId); if (myIdx2 === undefined) return;
         const gr = ownerGridRef.current; let sx = 0, sy = 0, cnt = 0;
-        for (let i = 0; i < gr.length; i++) if (gr[i] === myIdx) { sx += i % GRID_W; sy += Math.floor(i / GRID_W); cnt++; }
+        for (let i = 0; i < gr.length; i++) if (gr[i] === myIdx2) { sx += i % GRID_W; sy += Math.floor(i / GRID_W); cnt++; }
         if (cnt === 0) return;
         const mr2 = mapRectRef.current;
         const wx = mr2.x + (sx / cnt / GRID_W) * mr2.w, wy = mr2.y + (sy / cnt / GRID_H) * mr2.h;
@@ -807,24 +861,16 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
       if (e.key === "Escape") {
         setPlaceMode(null); placeModeRef.current = null;
         setBombMode(null); bombModeRef.current = null;
-        myTargetRef.current = null;
-        setAttackTarget(null);
+        setContextMenu(null);
       }
-      // Number keys 1-8 for buildings
       const num = parseInt(e.key);
       if (num >= 1 && num <= 8) {
-        const toolbar: BuildingType[] = ["city", "factory", "port", "naval_base", "defense_post", "fort", "missile_silo", "sam_launcher"];
-        const btype = toolbar[num - 1];
+        const btype = TOOLBAR[num - 1];
         if (btype) {
-          if (placeModeRef.current?.type === btype) {
-            setPlaceMode(null); placeModeRef.current = null;
-          } else {
-            setPlaceMode({ type: btype }); placeModeRef.current = { type: btype };
-            setBombMode(null); bombModeRef.current = null;
-          }
+          if (placeModeRef.current?.type === btype) { setPlaceMode(null); placeModeRef.current = null; }
+          else { setPlaceMode({ type: btype }); placeModeRef.current = { type: btype }; setBombMode(null); bombModeRef.current = null; }
         }
       }
-      // Q/E for unit type
       if (e.key === "q" || e.key === "Q") { setUnitType("infantry"); unitTypeRef.current = "infantry"; }
       if (e.key === "e" || e.key === "E") { setUnitType("tank"); unitTypeRef.current = "tank"; }
       if (e.key === "r" || e.key === "R") { setUnitType("warship"); unitTypeRef.current = "warship"; }
@@ -864,25 +910,40 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     if (claims.length > 0) channelRef.current?.send({ type: "broadcast", event: "claim", payload: claims });
   }
 
-  // ── Set attack target ─────────────────────────────────────────────────────
-  function setMyTarget(targetIdx: number, ownerIdx: number, targetName?: string) {
-    const myIdx = playerIndexRef.current.get(playerId);
-    if (myIdx === undefined) return;
-    const target: AttackTarget = { ownerIdx, targetIdx, unitType: unitTypeRef.current };
-    myTargetRef.current = target;
-    channelRef.current?.send({ type: "broadcast", event: "target", payload: target });
-    setAttackTarget(targetName ? { name: targetName } : null);
+  // ── Launch squad (land attack) ────────────────────────────────────────────
+  function launchSquad(targetGridIdx: number, fromGridIdx: number, ownerIdx: number, ownerPid: string, targetName?: string) {
+    const me = playersRef.current.get(ownerPid); if (!me) return;
+    const sendUnits = Math.max(1, Math.floor(me.units * sendPctRef.current / 100));
+    if (sendUnits < 1) { notify("Not enough units", "error"); return; }
+
+    const mr = mapRectRef.current;
+    const squad: Squad = {
+      id: crypto.randomUUID(), ownerIdx, ownerPid,
+      unitType: unitTypeRef.current,
+      unitsStart: sendUnits, unitsCurrent: sendUnits,
+      targetGridIdx, fromGridIdx, progress: 0, isNaval: false,
+      targetName,
+      screenFromX: mr.x + (fromGridIdx % GRID_W + 0.5) / GRID_W * mr.w,
+      screenFromY: mr.y + (Math.floor(fromGridIdx / GRID_W) + 0.5) / GRID_H * mr.h,
+      screenToX:   mr.x + (targetGridIdx % GRID_W + 0.5) / GRID_W * mr.w,
+      screenToY:   mr.y + (Math.floor(targetGridIdx / GRID_W) + 0.5) / GRID_H * mr.h,
+    };
+    squadsRef.current = [...squadsRef.current, squad];
+    setMySquads([...squadsRef.current.filter(s => s.ownerPid === playerId)]);
+    channelRef.current?.send({ type: "broadcast", event: "squad", payload: squad });
+    me.units = Math.max(0, me.units - sendUnits);
+    supabase.from("lobby_players").update({ units: me.units }).eq("lobby_id", lobby.id).eq("player_id", ownerPid);
+    if (targetName) notify(`${sendUnits} troops sent to attack ${targetName}!`, "success");
+    else notify(`${sendUnits} troops marching!`, "success");
   }
 
-  // ── Naval attack — only valid target is enemy/neutral COASTLINE ───────────
+  // ── Naval attack ──────────────────────────────────────────────────────────
   function launchShip(targetIdx: number, ownerIdx: number, ownerPid: string) {
     const coast = coastMaskRef.current; if (!coast) return;
-    // Target must be a coast or land tile — ships attack coastlines
-    const mask = landMaskRef.current;
-    if (!mask || !mask[targetIdx]) { notify("Ships can only attack land tiles", "error"); return; }
+    const mask = landMaskRef.current; if (!mask) return;
 
     const grid = ownerGridRef.current;
-    // Find nearest OWN coastal tile as departure point
+    // Departure: nearest own coast tile
     let bestFrom = -1, bestDist = Infinity;
     for (let i = 0; i < grid.length; i++) {
       if (grid[i] !== ownerIdx || !coast[i]) continue;
@@ -891,12 +952,9 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     }
     if (bestFrom === -1) { notify("Need a coastal tile to launch ships", "error"); return; }
 
-    // Find nearest ENEMY/NEUTRAL coastal tile to the target as actual landing point
+    // Landing: find nearest coast on target area (enemy or neutral)
     let landingIdx = targetIdx;
-    if (coast[targetIdx]) {
-      landingIdx = targetIdx; // already coastal, good
-    } else {
-      // Find nearest coastal tile to the clicked land tile
+    if (!coast[targetIdx]) {
       let nearestCoast = -1, nearestDist = Infinity;
       const tx = targetIdx % GRID_W, ty = Math.floor(targetIdx / GRID_W);
       for (let i = 0; i < coast.length; i++) {
@@ -916,8 +974,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
       id: crypto.randomUUID(), ownerIdx,
       fromX: mr.x + (bestFrom % GRID_W + 0.5) * cW, fromY: mr.y + (Math.floor(bestFrom / GRID_W) + 0.5) * cH,
       toX:   mr.x + (landingIdx % GRID_W + 0.5) * cW, toY: mr.y + (Math.floor(landingIdx / GRID_W) + 0.5) * cH,
-      units: sendUnits, targetGridIdx: landingIdx, progress: 0,
-      distanceTiles: Math.max(1, dist),
+      units: sendUnits, targetGridIdx: landingIdx, progress: 0, distanceTiles: Math.max(1, dist),
     };
     shipsRef.current = [...shipsRef.current, ship];
     channelRef.current?.send({ type: "broadcast", event: "ship", payload: ship });
@@ -974,14 +1031,12 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     notify(`${btype.charAt(0).toUpperCase() + btype.slice(1)} bomb detonated!`, "success");
   }
 
-  // ── Build cost (scales with count) ────────────────────────────────────────
   function getBuildCost(type: BuildingType, ownerIdx: number): [number, number] {
     const [bc, bu] = BUILD_COST[type];
     const n = buildingsRef.current.filter(b => b.ownerIdx === ownerIdx && b.type === type).length;
     return [Math.round(bc * (1 + n * 0.5)), Math.round(bu * (1 + n * 0.5))];
   }
 
-  // ── Place building ────────────────────────────────────────────────────────
   function doPlaceBuilding(gx: number, gy: number, type: BuildingType) {
     setPlaceMode(null); placeModeRef.current = null;
     const me = playersRef.current.get(playerId); if (!me) return;
@@ -1007,6 +1062,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
   // ── Click handler ─────────────────────────────────────────────────────────
   function handleClick(e: React.MouseEvent) {
     if (dragMovedRef.current) { dragMovedRef.current = false; return; }
+    setContextMenu(null);
     const coords = screenToGrid(e.clientX, e.clientY); if (!coords) return;
     const { gx, gy } = coords;
     const me = playersRef.current.get(playerId); if (!me) return;
@@ -1014,18 +1070,15 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     const i = gy * GRID_W + gx;
     const mask = landMaskRef.current; if (!mask) return;
 
-    // Bomb mode
     if (bombModeRef.current) {
       dropBomb(i, bombModeRef.current, playerId);
       setBombMode(null); bombModeRef.current = null; return;
     }
-    // Place mode
     if (placeModeRef.current) {
       if (!mask[i]) { notify("Click on land", "error"); return; }
       doPlaceBuilding(gx, gy, placeModeRef.current.type); return;
     }
 
-    // No territory yet — spawn
     const grid = ownerGridRef.current;
     let hasTerritory = false;
     for (let k = 0; k < grid.length; k++) if (grid[k] === myIdx) { hasTerritory = true; break; }
@@ -1033,19 +1086,29 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
       if (!mask[i]) { notify("Click on land to start", "error"); return; }
       if (grid[i] !== -1) { notify("Pick an unclaimed tile", "error"); return; }
       plantStarter(i, myIdx); setHasSpawned(true);
-      notify("Empire founded! Click enemy territory to attack.", "success"); return;
+      notify("Empire founded! Click enemy territory to send troops.", "success"); return;
     }
 
-    // Click on own territory — cancel attack target
-    if (grid[i] === myIdx) {
-      myTargetRef.current = null;
-      setAttackTarget(null);
-      notify("Attack cancelled", "info"); return;
-    }
-
+    // Click own territory — do nothing (cancel would be right-click)
+    if (grid[i] === myIdx) return;
     if (!mask[i]) { notify("Click on land", "error"); return; }
 
-    // Check if target is reachable by land
+    // Determine attack target name
+    const targetOwnerIdx = grid[i];
+    let targetName: string | undefined;
+    if (targetOwnerIdx >= 0) {
+      const entry = [...playerIndexRef.current.entries()].find(([, v]) => v === targetOwnerIdx);
+      if (entry) targetName = playersRef.current.get(entry[0])?.name;
+    }
+
+    // Warship — only if target is sea or you have port and it's overseas
+    if (unitTypeRef.current === "warship") {
+      const hasPort = buildingsRef.current.some(b => b.ownerIdx === myIdx && b.type === "port");
+      if (!hasPort) { notify("Build a Port to use warships", "error"); return; }
+      launchShip(i, myIdx, playerId); return;
+    }
+
+    // Check land reachability
     let reachable = false;
     {
       const reach = new Uint8Array(grid.length); const q: number[] = [];
@@ -1073,38 +1136,42 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     }
 
     if (reachable) {
-      // Set land attack target
-      const targetOwnerIdx = grid[i];
-      let targetName: string | undefined;
-      if (targetOwnerIdx >= 0) {
-        const entry = [...playerIndexRef.current.entries()].find(([, v]) => v === targetOwnerIdx);
-        if (entry) targetName = playersRef.current.get(entry[0])?.name;
-      }
-      setMyTarget(i, myIdx, targetName);
-      if (targetName) notify(`Attacking ${targetName}!`, "info");
+      // Find nearest border cell as launch point
+      const owned: number[] = [];
+      for (let k = 0; k < grid.length; k++) if (grid[k] === myIdx) owned.push(k);
+      const border = owned.reduce((best, k) => {
+        const d = Math.abs(k % GRID_W - i % GRID_W) + Math.abs(Math.floor(k / GRID_W) - Math.floor(i / GRID_W));
+        return d < best.d ? { k, d } : best;
+      }, { k: owned[0], d: Infinity });
+      launchSquad(i, border.k, myIdx, playerId, targetName);
     } else {
-      // Not reachable by land — try naval
       const hasPort = buildingsRef.current.some(b => b.ownerIdx === myIdx && b.type === "port");
-      if (hasPort) {
-        launchShip(i, myIdx, playerId);
-      } else {
-        notify("No land path — build a Port for naval attacks", "error");
-      }
+      if (hasPort) { launchShip(i, myIdx, playerId); }
+      else { notify("No land path — build a Port for naval attacks, or switch to Warship [R]", "error"); }
     }
   }
 
-  // ── Right click — cancel current action or open context for building ──────
+  // ── Right click — context menu ────────────────────────────────────────────
   function handleContextMenu(e: React.MouseEvent) {
     e.preventDefault();
     if (placeModeRef.current || bombModeRef.current) {
-      setPlaceMode(null); setBombMode(null);
-      placeModeRef.current = null; bombModeRef.current = null; return;
+      setPlaceMode(null); setBombMode(null); placeModeRef.current = null; bombModeRef.current = null; return;
     }
-    // Cancel attack target
-    if (myTargetRef.current) {
-      myTargetRef.current = null;
-      setAttackTarget(null); return;
-    }
+
+    const coords = screenToGrid(e.clientX, e.clientY);
+    if (!coords) { setContextMenu(null); return; }
+    const { gx, gy } = coords;
+    const i = gy * GRID_W + gx;
+    const grid = ownerGridRef.current;
+    const myIdx = playerIndexRef.current.get(playerId);
+    const targetOwnerIdx = grid[i];
+    if (targetOwnerIdx < 0 || targetOwnerIdx === myIdx) { setContextMenu(null); return; }
+    const entry = [...playerIndexRef.current.entries()].find(([, v]) => v === targetOwnerIdx);
+    if (!entry) { setContextMenu(null); return; }
+    const [targetPid] = entry;
+    const targetPlayer = playersRef.current.get(targetPid);
+    if (!targetPlayer) { setContextMenu(null); return; }
+    setContextMenu({ x: e.clientX, y: e.clientY, targetPlayerIdx: targetOwnerIdx, targetPlayerPid: targetPid, targetName: targetPlayer.name });
   }
 
   // ── Derived state ─────────────────────────────────────────────────────────
@@ -1112,7 +1179,6 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
   const me = playersRef.current.get(playerId);
   const myIdx = playerIndexRef.current.get(playerId);
   const hasSilo = myIdx !== undefined && buildingsRef.current.some(b => b.ownerIdx === myIdx && b.type === "missile_silo");
-  const TOOLBAR: BuildingType[] = ["city", "factory", "port", "naval_base", "defense_post", "fort", "missile_silo", "sam_launcher"];
 
   // ── Game Over ─────────────────────────────────────────────────────────────
   if (isDead && !isSpectating) {
@@ -1144,11 +1210,11 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
   }
 
   return (
-    <div ref={containerRef} className="relative h-screen w-screen overflow-hidden bg-[#0a1628]">
+    <div ref={containerRef} className="relative h-screen w-screen overflow-hidden bg-[#0a1628]" onClick={() => setContextMenu(null)}>
       <canvas
         ref={canvasRef}
         className="absolute inset-0"
-        style={{ cursor: placeMode || bombMode ? "crosshair" : "default" }}
+        style={{ cursor: "default" }}
         onClick={handleClick}
         onContextMenu={handleContextMenu}
       />
@@ -1168,13 +1234,6 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         </div>
       )}
 
-      {/* Attack target indicator */}
-      {attackTarget && (
-        <div className="absolute top-14 left-1/2 -translate-x-1/2 z-10 flex items-center gap-2 rounded-lg border border-yellow-500/60 bg-card/90 px-3 py-1.5 text-xs font-bold text-yellow-300 backdrop-blur-md shadow">
-          ⚔️ Attacking {attackTarget.name ?? "territory"} — Right-click or click own land to cancel
-        </div>
-      )}
-
       {/* Leaderboard */}
       <div className="absolute left-3 top-3 w-56 rounded-xl border border-border/60 bg-card/85 p-2 shadow-lg backdrop-blur-md z-10">
         <div className="mb-1 px-2 text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Leaderboard</div>
@@ -1188,8 +1247,141 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         ))}
       </div>
 
+      {/* Hover panel — right side */}
+      {hoverPanel && hoverPanel.playerIdx !== myIdx && (
+        <div className="absolute right-3 top-3 w-64 rounded-xl border border-border/60 bg-card/92 p-3 shadow-xl backdrop-blur-md z-10 pointer-events-none">
+          <div className="flex items-center gap-2 mb-2">
+            <span className="h-3 w-3 rounded-sm flex-shrink-0" style={{ backgroundColor: hoverPanel.color }} />
+            <span className="font-bold text-sm truncate">{hoverPanel.name}</span>
+            <span className="ml-auto text-[10px] text-muted-foreground">{hoverPanel.isBot ? "Bot" : "Player"} · Neutral</span>
+          </div>
+          <div className="grid grid-cols-2 gap-1 text-xs mb-2">
+            <div className="rounded bg-background/60 px-2 py-1">
+              <div className="text-muted-foreground text-[9px]">TROOPS</div>
+              <div className="font-mono font-bold">{fmt(hoverPanel.units)}</div>
+            </div>
+            <div className="rounded bg-yellow-500/10 border border-yellow-500/30 px-2 py-1">
+              <div className="text-muted-foreground text-[9px]">GOLD</div>
+              <div className="font-mono font-bold text-yellow-400">{fmt(hoverPanel.coins)}</div>
+            </div>
+            <div className="rounded bg-background/60 px-2 py-1">
+              <div className="text-muted-foreground text-[9px]">TILES</div>
+              <div className="font-mono font-bold">{hoverPanel.pixels}</div>
+            </div>
+            {mySquads.filter(s => s.targetName === hoverPanel.name).length > 0 && (
+              <div className="rounded bg-red-500/10 border border-red-500/30 px-2 py-1">
+                <div className="text-muted-foreground text-[9px]">YOUR ATTACK</div>
+                <div className="font-mono font-bold text-red-400">
+                  {fmt(mySquads.filter(s => s.targetName === hoverPanel.name).reduce((sum, s) => sum + Math.floor(s.unitsCurrent), 0))}
+                </div>
+              </div>
+            )}
+          </div>
+          {hoverPanel.buildings.length > 0 && (
+            <div className="border-t border-border/40 pt-2">
+              <div className="text-[9px] font-bold uppercase tracking-wider text-muted-foreground mb-1">Buildings</div>
+              {hoverPanel.buildings.map((b, bi) => (
+                <div key={bi} className="flex items-center gap-1 text-[10px] py-0.5">
+                  <span>{BUILDING_ICONS[b.type]}</span>
+                  <span className="flex-1">{BUILDING_LABELS[b.type]}</span>
+                  <span className="text-muted-foreground text-[9px] truncate max-w-[100px]">{BUILD_STAT[b.type]}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="text-[9px] text-muted-foreground mt-2 border-t border-border/40 pt-1">Right-click for options</div>
+        </div>
+      )}
+
+      {/* Active squads progress bars — bottom left stack */}
+      {!isSpectating && mySquads.length > 0 && (
+        <div className="absolute left-3 bottom-32 flex flex-col gap-1.5 z-10 max-w-[220px]">
+          {mySquads.map(sq => {
+            const healthPct = sq.unitsCurrent / sq.unitsStart;
+            const icons: Record<UnitType, string> = { infantry: "🪖", tank: "🚜", warship: "🚢" };
+            return (
+              <div key={sq.id} className="rounded-lg border border-border/60 bg-card/90 backdrop-blur-md px-2.5 py-1.5 shadow">
+                <div className="flex items-center gap-1.5 mb-1">
+                  <span className="text-sm">{icons[sq.unitType]}</span>
+                  <span className="text-xs font-bold truncate flex-1">{sq.targetName ?? "Territory"}</span>
+                  <span className="text-[10px] font-mono text-muted-foreground">{Math.floor(sq.unitsCurrent)}/{sq.unitsStart}</span>
+                  <button
+                    onClick={() => { squadsRef.current = squadsRef.current.filter(s => s.id !== sq.id); setMySquads(prev => prev.filter(s => s.id !== sq.id)); }}
+                    className="h-4 w-4 rounded text-muted-foreground hover:text-destructive flex items-center justify-center">
+                    <X className="h-2.5 w-2.5" />
+                  </button>
+                </div>
+                {/* Progress bar */}
+                <div className="relative h-1.5 w-full rounded-full bg-muted overflow-hidden mb-0.5">
+                  <div className="absolute left-0 top-0 h-full rounded-full bg-blue-500 transition-all" style={{ width: `${sq.progress * 100}%` }} />
+                </div>
+                {/* Health bar */}
+                <div className="relative h-1.5 w-full rounded-full bg-muted overflow-hidden">
+                  <div className="absolute left-0 top-0 h-full rounded-full transition-all"
+                    style={{ width: `${healthPct * 100}%`, backgroundColor: healthPct > 0.5 ? "#22c55e" : healthPct > 0.25 ? "#f59e0b" : "#ef4444" }} />
+                </div>
+                <div className="flex justify-between text-[9px] text-muted-foreground mt-0.5">
+                  <span>March {Math.round(sq.progress * 100)}%</span>
+                  <span>HP {Math.round(healthPct * 100)}%</span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Right-click context menu */}
+      {contextMenu && (
+        <div
+          className="absolute z-50 rounded-xl border border-border/80 bg-card/98 shadow-2xl backdrop-blur-md overflow-hidden min-w-[180px]"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onClick={e => e.stopPropagation()}
+        >
+          <div className="px-3 py-2 border-b border-border/40 text-xs font-bold text-muted-foreground">{contextMenu.targetName}</div>
+          {[
+            { icon: <Swords className="h-3.5 w-3.5" />, label: "Attack", color: "text-red-400", action: () => {
+              const myIdx2 = playerIndexRef.current.get(playerId); if (myIdx2 === undefined) return;
+              const grid = ownerGridRef.current;
+              const owned: number[] = [];
+              for (let k = 0; k < grid.length; k++) if (grid[k] === myIdx2) owned.push(k);
+              const enemyTiles: number[] = [];
+              for (let k = 0; k < grid.length; k++) if (grid[k] === contextMenu.targetPlayerIdx) enemyTiles.push(k);
+              if (enemyTiles.length === 0 || owned.length === 0) return;
+              const target = enemyTiles[Math.floor(enemyTiles.length / 2)];
+              const border = owned.reduce((best, k) => { const d = Math.abs(k % GRID_W - target % GRID_W) + Math.abs(Math.floor(k / GRID_W) - Math.floor(target / GRID_W)); return d < best.d ? { k, d } : best; }, { k: owned[0], d: Infinity });
+              launchSquad(target, border.k, myIdx2, playerId, contextMenu.targetName);
+              setContextMenu(null);
+            }},
+            { icon: <Handshake className="h-3.5 w-3.5" />, label: "Request Alliance", color: "text-green-400", action: () => {
+              notify(`Alliance request sent to ${contextMenu.targetName}`, "info");
+              channelRef.current?.send({ type: "broadcast", event: "alliance_req", payload: { from: playerId, to: contextMenu.targetPlayerPid } });
+              setContextMenu(null);
+            }},
+            { icon: <ArrowLeftRight className="h-3.5 w-3.5" />, label: "Propose Trade", color: "text-yellow-400", action: () => {
+              notify(`Trade proposal sent to ${contextMenu.targetName}`, "info");
+              channelRef.current?.send({ type: "broadcast", event: "trade_req", payload: { from: playerId, to: contextMenu.targetPlayerPid } });
+              setContextMenu(null);
+            }},
+            { icon: <MessageSquare className="h-3.5 w-3.5" />, label: "Send Message", color: "text-blue-400", action: () => {
+              const msg = prompt(`Message to ${contextMenu.targetName}:`);
+              if (msg) {
+                channelRef.current?.send({ type: "broadcast", event: "player_msg", payload: { from: playerId, to: contextMenu.targetPlayerPid, text: msg } });
+                notify("Message sent", "success");
+              }
+              setContextMenu(null);
+            }},
+          ].map(item => (
+            <button key={item.label} onClick={item.action}
+              className={`flex w-full items-center gap-2.5 px-3 py-2 text-xs hover:bg-secondary/80 transition-colors ${item.color}`}>
+              {item.icon}
+              <span className="font-medium">{item.label}</span>
+            </button>
+          ))}
+        </div>
+      )}
+
       {!isSpectating && (
-        <Button onClick={onLeave} variant="secondary" size="sm" className="absolute right-3 top-3 gap-1.5 bg-card/85 backdrop-blur-md z-10">
+        <Button onClick={onLeave} variant="secondary" size="sm" className="absolute right-3 bottom-3 gap-1.5 bg-card/85 backdrop-blur-md z-10">
           <LogOut className="h-3.5 w-3.5" />Leave
         </Button>
       )}
@@ -1205,7 +1397,8 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
               const canAfford = me && (me.coins || 0) >= cc && me.units >= cu;
               const isActive = placeMode?.type === btype;
               return (
-                <button key={btype} title={`[${idx + 1}] ${BUILDING_LABELS[btype]} — ${cc}💰${cu > 0 ? ` ${cu}⚔` : ""}`}
+                <button key={btype}
+                  title={`[${idx + 1}] ${BUILDING_LABELS[btype]}\n${BUILD_STAT[btype]}\nCost: ${cc}💰${cu > 0 ? ` ${cu}⚔` : ""}`}
                   disabled={!canAfford}
                   onClick={() => {
                     if (isActive) { setPlaceMode(null); placeModeRef.current = null; return; }
@@ -1215,7 +1408,8 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
                   className={`flex flex-col items-center justify-center w-14 h-14 rounded border transition-all relative ${isActive ? "border-yellow-400 bg-yellow-400/20" : "border-border/60 bg-background/60 hover:bg-secondary/80"} disabled:opacity-35 disabled:cursor-not-allowed`}>
                   <span className="absolute top-0.5 left-1 text-[9px] text-muted-foreground font-mono">{idx + 1}</span>
                   <span className="text-lg">{BUILDING_ICONS[btype]}</span>
-                  <span className="text-[9px] font-mono text-muted-foreground">{count > 0 ? `${count}x · ` : ""}{cc}💰</span>
+                  <span className="text-[9px] font-mono text-muted-foreground leading-tight">{count > 0 ? `${count}× ` : ""}{cc}💰</span>
+                  <span className="text-[8px] text-muted-foreground/70 leading-none truncate w-full text-center px-0.5">{BUILD_STAT[btype].split("·")[0].trim()}</span>
                 </button>
               );
             })}
@@ -1250,16 +1444,16 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
             )}
             <div className="h-8 w-px bg-border" />
 
-            {/* Unit type — Q/E/R shortcuts */}
+            {/* Unit type */}
             <div className="flex flex-col items-center gap-0.5">
               <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Unit [Q/E/R]</span>
               <div className="flex gap-1">
                 {(["infantry", "tank", "warship"] as UnitType[]).map((ut, ki) => {
                   const icons: Record<UnitType, string> = { infantry: "🪖", tank: "🚜", warship: "🚢" };
                   const keys = ["Q", "E", "R"];
-                  const cost = UNIT_COST[ut];
+                  const hints: Record<UnitType, string> = { infantry: "1× power", tank: "2.5× power", warship: "Naval only · needs Port" };
                   return (
-                    <button key={ut} title={`[${keys[ki]}] ${ut}${cost ? ` — ${cost}💰/attack` : ""} — ${UNIT_MULT[ut]}× power`}
+                    <button key={ut} title={`[${keys[ki]}] ${ut} — ${hints[ut]}`}
                       onClick={() => { setUnitType(ut); unitTypeRef.current = ut; }}
                       className={`flex flex-col items-center justify-center w-9 h-9 rounded border text-sm transition-all relative ${unitType === ut ? "border-primary bg-primary/20" : "border-border/60 bg-background/60 hover:bg-secondary/80"}`}>
                       <span className="absolute top-0 left-0.5 text-[8px] text-muted-foreground">{keys[ki]}</span>
@@ -1271,19 +1465,20 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
             </div>
             <div className="h-8 w-px bg-border" />
 
-            {/* Attack ratio slider */}
+            {/* Send percentage */}
             <div className="flex flex-col items-center gap-0.5">
-              <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Attack Ratio</span>
+              <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Send %</span>
               <div className="flex items-center gap-1.5">
                 <input type="range" min={5} max={100} step={5} value={sendPct}
                   onChange={e => { setSendPct(+e.target.value); sendPctRef.current = +e.target.value; }}
                   className="w-24 accent-primary" />
                 <span className="w-10 text-right font-mono text-xs font-bold text-primary">{sendPct}%</span>
               </div>
+              {me && <span className="text-[9px] text-muted-foreground">{fmt(Math.floor(me.units * sendPct / 100))} troops</span>}
             </div>
             <div className="h-8 w-px bg-border" />
 
-            {/* Camera buttons */}
+            {/* Camera */}
             <div className="flex gap-1">
               {[
                 { title: "Zoom in", label: "+", fn: () => { const c = camRef.current; c.zoom = Math.min(10, c.zoom * 1.25); } },
@@ -1309,8 +1504,8 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
             <div className="h-8 w-px bg-border" />
             <div className="text-[9px] text-muted-foreground leading-tight">
               <div>WASD/Arrows: pan</div>
-              <div>Esc: cancel</div>
-              <div>1-8: buildings</div>
+              <div>Esc: cancel · C: center</div>
+              <div>Right-click: options</div>
             </div>
           </div>
         </div>
