@@ -12,9 +12,13 @@ import {
 } from "@/game/balance";
 import { floodAttack, plantStarterCluster } from "@/game/flood";
 import {
-  computeMapRect, drawTerritory, drawCellBorders, drawBuildings, drawNameplates,
+  computeMapRect, drawTerritory, drawTerritoryOutlines, drawBuildings, drawTerritoryLabels,
   type MapRect,
 } from "@/game/render";
+
+// How fast the attack flood visibly spreads (cells per second per attack)
+const ATTACK_CELLS_PER_SEC = 220;
+type PendingClaim = { i: number; o: number; revealAt: number };
 
 interface GameScreenProps {
   lobby: Lobby;
@@ -57,6 +61,11 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
   const lastSyncRef = useRef<number>(0);
   const lastBotMoveRef = useRef<number>(0);
   const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
+  const pendingClaimsRef = useRef<PendingClaim[]>([]);
+
+  // Save what each cell looked like BEFORE a pending claim, so we can revert
+  // the live grid until the wave reveals it. Indexed by grid position.
+  const preClaimOwnerRef = useRef<Map<number, number>>(new Map());
 
   const camRef = useRef({ x: 0, y: 0, zoom: 1 });
   const dragRef = useRef({ active: false, startX: 0, startY: 0, camX: 0, camY: 0 });
@@ -84,6 +93,27 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     const entry = [...playerIndexRef.current.entries()].find(([, v]) => v === defIdx);
     const p = entry ? playersRef.current.get(entry[0]) : null;
     return p ? Math.max(1, Math.sqrt(p.units) / 5) : 1;
+  }, []);
+
+  /**
+   * Stage a list of claims to reveal over time so the flood is visible as a
+   * spreading wave (OpenFront style). Claims are expected in BFS order.
+   */
+  const scheduleClaimAnimation = useCallback((claims: Claim[]) => {
+    if (claims.length === 0) return;
+    const grid = ownerGridRef.current;
+    const now = performance.now();
+    const stepMs = 1000 / ATTACK_CELLS_PER_SEC;
+    for (let k = 0; k < claims.length; k++) {
+      const c = claims[k];
+      // Remember pre-claim owner so we can show the OLD value until reveal
+      if (!preClaimOwnerRef.current.has(c.i)) {
+        preClaimOwnerRef.current.set(c.i, grid[c.i]);
+      }
+      // Revert grid to pre-claim value (so the cell isn't visible yet)
+      grid[c.i] = preClaimOwnerRef.current.get(c.i)!;
+      pendingClaimsRef.current.push({ i: c.i, o: c.o, revealAt: now + k * stepMs });
+    }
   }, []);
 
   // Broadcast helper
@@ -125,8 +155,8 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         })
       .on("broadcast", { event: "claim" }, ({ payload }) => {
         const claims = payload as Claim[];
-        const grid = ownerGridRef.current;
-        for (const c of claims) grid[c.i] = c.o;
+        // Animate remote claims too — stage them with delay so the wave is visible
+        scheduleClaimAnimation(claims);
       })
       .on("broadcast", { event: "building" }, ({ payload }) => {
         const b = payload as Building;
@@ -160,6 +190,8 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     });
 
     broadcastClaims(res.claims);
+    // Animate locally too: revert in-grid mutations and stage them with delays
+    scheduleClaimAnimation(res.claims);
 
     const newUnits = Math.max(0, currentUnits - res.spent);
     const playerObj = playersRef.current.get(ownerPid);
@@ -174,7 +206,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
       repelled: res.claims.length === 0,
       reachedTarget: res.reachedTarget, unreachable: res.unreachable,
     };
-  }, [broadcastClaims, defenderStrength, lobby.id]);
+  }, [broadcastClaims, defenderStrength, lobby.id, scheduleClaimAnimation]);
 
   // Plant starter
   const plantStarter = useCallback((centerIdx: number, ownerIdx: number) => {
@@ -259,10 +291,26 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
       else { ctx.fillStyle = "#1a3050"; ctx.fillRect(mr.x, mr.y, mr.w, mr.h); }
 
       const grid = ownerGridRef.current;
+
+      // Apply any pending claims whose reveal time has come (animated flood)
+      if (pendingClaimsRef.current.length > 0) {
+        const now2 = performance.now();
+        const stillPending: PendingClaim[] = [];
+        for (const c of pendingClaimsRef.current) {
+          if (c.revealAt <= now2) {
+            grid[c.i] = c.o;
+            preClaimOwnerRef.current.delete(c.i);
+          } else {
+            stillPending.push(c);
+          }
+        }
+        pendingClaimsRef.current = stillPending;
+      }
+
       drawTerritory(ctx, off, offCtx, imgData, grid, colorsRef.current, mr);
-      drawCellBorders(ctx, grid, mr, cam.zoom);
+      drawTerritoryOutlines(ctx, grid, mr, cam.zoom);
       drawBuildings(ctx, buildingsRef.current, mr, playerIndexRef.current, playersRef.current);
-      drawNameplates(ctx, grid, mr, cam.zoom, playerIndexRef.current, playersRef.current, colorsRef.current.length);
+      drawTerritoryLabels(ctx, grid, mr, cam.zoom, playerIndexRef.current, playersRef.current, colorsRef.current.length);
 
       ctx.restore();
     }
@@ -445,6 +493,16 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
   const myCubeCount = me ? me.pixels : 0;
   const sendingUnits = me ? Math.max(1, Math.floor(me.units * sendPct / 100)) : 0;
 
+  // Total land cells for percentage display (only counts land mask)
+  const totalLand = (() => {
+    const m = landMaskRef.current;
+    if (!m) return 1;
+    let n = 0;
+    for (let i = 0; i < m.length; i++) if (m[i]) n++;
+    return n || 1;
+  })();
+  const pctOwned = (n: number) => ((n / totalLand) * 100).toFixed(n / totalLand >= 0.01 ? 1 : 2);
+
   return (
     <div ref={containerRef} className="relative h-screen w-screen overflow-hidden bg-background">
       <canvas
@@ -462,62 +520,71 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         </div>
       )}
 
-      <div className="absolute right-3 top-3 w-56 rounded-xl border border-border/60 bg-card/85 p-2 shadow-lg backdrop-blur-md">
-        <div className="mb-1 px-2 text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Leaderboard</div>
-        <div className="space-y-0.5">
+      {/* TOP-LEFT: Leaderboard (OpenFront style: Rank | Player | Owned %) */}
+      <div className="absolute left-3 top-12 w-60 rounded-lg border border-border/50 bg-slate-900/85 text-slate-100 shadow-xl">
+        <div className="grid grid-cols-[28px_1fr_60px] gap-1 border-b border-slate-700/60 px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+          <span>#</span><span>Player</span><span className="text-right">Owned</span>
+        </div>
+        <div className="py-1">
           {sortedPlayers.slice(0, 10).map((p, i) => (
-            <div key={p.id} className={`flex items-center gap-2 rounded px-2 py-1 text-xs ${p.player_id === playerId ? "bg-primary/15" : ""}`}>
-              <span className="w-3 text-right text-muted-foreground">{i + 1}</span>
-              <span className="h-2.5 w-2.5 rounded-sm" style={{ backgroundColor: p.color }} />
-              <span className="flex-1 truncate font-medium">{p.name}</span>
-              <span className="font-mono text-muted-foreground">{p.pixels}</span>
+            <div key={p.id}
+              className={`grid grid-cols-[28px_1fr_60px] gap-1 px-3 py-1 text-xs ${p.player_id === playerId ? "bg-primary/20" : ""}`}>
+              <span className="text-slate-400">{i + 1}</span>
+              <span className="flex items-center gap-1.5 truncate">
+                <span className="h-2 w-2 rounded-sm flex-shrink-0" style={{ backgroundColor: p.color }} />
+                <span className="truncate font-medium">{p.name}</span>
+              </span>
+              <span className="text-right font-mono font-bold">{pctOwned(p.pixels)}%</span>
             </div>
           ))}
         </div>
       </div>
 
-      <Button onClick={onLeave} variant="secondary" size="sm" className="absolute left-3 top-3 gap-1.5 bg-card/85 backdrop-blur-md">
+      {/* TOP-LEFT: Leave button above leaderboard */}
+      <Button onClick={onLeave} variant="secondary" size="sm" className="absolute left-3 top-3 gap-1.5 bg-slate-900/85 text-slate-100 border-slate-700/60 hover:bg-slate-800">
         <LogOut className="h-3.5 w-3.5" /> Leave
       </Button>
 
-      <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-4 rounded-xl border border-border/60 bg-card/90 px-5 py-2.5 backdrop-blur-md shadow-lg">
-        <div className="flex flex-col items-center gap-1">
-          <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Send</span>
-          <div className="flex items-center gap-2">
+      {/* TOP-RIGHT: zoom controls */}
+      <div className="absolute right-3 top-3 flex gap-1 rounded-lg border border-border/50 bg-slate-900/85 p-1 shadow-lg">
+        <button title="Zoom in" onClick={() => { const c = camRef.current; c.zoom = Math.min(8, c.zoom * 1.25); }}
+          className="flex h-7 w-7 items-center justify-center rounded text-sm text-slate-100 hover:bg-slate-700">+</button>
+        <button title="Zoom out" onClick={() => { const c = camRef.current; c.zoom = Math.max(0.4, c.zoom * 0.8); }}
+          className="flex h-7 w-7 items-center justify-center rounded text-sm text-slate-100 hover:bg-slate-700">−</button>
+        <button title="Reset view" onClick={() => { camRef.current = { x: 0, y: 0, zoom: 1 }; }}
+          className="flex h-7 w-7 items-center justify-center rounded text-xs text-slate-100 hover:bg-slate-700">⌂</button>
+      </div>
+
+      {/* BOTTOM-LEFT: Compact stats + attack ratio (OpenFront-style) */}
+      {me && (
+        <div className="absolute left-3 bottom-3 w-72 rounded-lg border border-border/50 bg-slate-900/90 text-slate-100 shadow-xl">
+          <div className="space-y-0.5 border-b border-slate-700/60 px-3 py-2 text-xs">
+            <div className="flex justify-between"><span className="font-bold text-slate-400">Player:</span>
+              <span className="flex items-center gap-1.5 font-bold">
+                <span className="h-2 w-2 rounded-sm" style={{ backgroundColor: me.color }} /> {me.name}
+              </span>
+            </div>
+            <div className="flex justify-between"><span className="font-bold text-slate-400">Troops:</span>
+              <span className="font-mono font-bold">{me.units.toLocaleString()}</span>
+            </div>
+            <div className="flex justify-between"><span className="font-bold text-slate-400">Owned:</span>
+              <span className="font-mono font-bold">{pctOwned(me.pixels)}% ({me.pixels} cells)</span>
+            </div>
+          </div>
+          <div className="px-3 py-2">
+            <div className="mb-1 flex items-center justify-between text-[11px] font-bold">
+              <span className="text-slate-300">Attack Ratio:</span>
+              <span className="font-mono text-primary">{sendPct}% ({sendingUnits.toLocaleString()})</span>
+            </div>
             <input type="range" min={5} max={100} step={5} value={sendPct}
               onChange={e => setSendPct(+e.target.value)}
-              className="w-32 accent-primary" />
-            <span className="w-12 text-right font-mono text-sm font-bold text-primary">{sendPct}%</span>
-          </div>
-          <span className="text-[10px] font-mono text-muted-foreground">{sendingUnits} units</span>
-        </div>
-        <div className="h-10 w-px bg-border" />
-        <div className="flex flex-col items-center gap-1 px-1">
-          <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Click to attack</span>
-          <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-            <Sword className="h-3 w-3" /> click any cell · right-click to build
-          </div>
-        </div>
-        <div className="h-10 w-px bg-border" />
-        <div className="flex gap-1">
-          <button title="Zoom in" onClick={() => { const c = camRef.current; c.zoom = Math.min(8, c.zoom * 1.25); }}
-            className="flex h-7 w-7 items-center justify-center rounded border border-border bg-background/60 text-sm hover:bg-secondary">+</button>
-          <button title="Zoom out" onClick={() => { const c = camRef.current; c.zoom = Math.max(0.4, c.zoom * 0.8); }}
-            className="flex h-7 w-7 items-center justify-center rounded border border-border bg-background/60 text-sm hover:bg-secondary">−</button>
-          <button title="Reset view" onClick={() => { camRef.current = { x: 0, y: 0, zoom: 1 }; }}
-            className="flex h-7 w-7 items-center justify-center rounded border border-border bg-background/60 text-xs hover:bg-secondary">⌂</button>
-        </div>
-        {me && (
-          <>
-            <div className="h-10 w-px bg-border" />
-            <div className="flex items-center gap-2 text-xs">
-              <span className="h-2.5 w-2.5 rounded-sm" style={{ backgroundColor: me.color }} />
-              <span className="font-medium">{me.name}</span>
-              <span className="font-mono text-muted-foreground">{me.units}u · {me.pixels} cells</span>
+              className="w-full accent-primary" />
+            <div className="mt-1.5 flex items-center gap-1.5 text-[10px] text-slate-400">
+              <Sword className="h-3 w-3" /> click any cell to attack · right-click to build
             </div>
-          </>
-        )}
-      </div>
+          </div>
+        </div>
+      )}
 
       {ctxMenu && (
         <div className="fixed z-50 min-w-[200px] overflow-hidden rounded-lg border border-border bg-card shadow-2xl"
