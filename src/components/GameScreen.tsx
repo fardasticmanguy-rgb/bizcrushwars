@@ -61,6 +61,11 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
   const lastSyncRef = useRef<number>(0);
   const lastBotMoveRef = useRef<number>(0);
   const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
+  const pendingClaimsRef = useRef<PendingClaim[]>([]);
+
+  // Save what each cell looked like BEFORE a pending claim, so we can revert
+  // the live grid until the wave reveals it. Indexed by grid position.
+  const preClaimOwnerRef = useRef<Map<number, number>>(new Map());
 
   const camRef = useRef({ x: 0, y: 0, zoom: 1 });
   const dragRef = useRef({ active: false, startX: 0, startY: 0, camX: 0, camY: 0 });
@@ -129,8 +134,8 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         })
       .on("broadcast", { event: "claim" }, ({ payload }) => {
         const claims = payload as Claim[];
-        const grid = ownerGridRef.current;
-        for (const c of claims) grid[c.i] = c.o;
+        // Animate remote claims too — stage them with delay so the wave is visible
+        scheduleClaimAnimation(claims);
       })
       .on("broadcast", { event: "building" }, ({ payload }) => {
         const b = payload as Building;
