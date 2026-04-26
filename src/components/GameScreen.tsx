@@ -4,31 +4,17 @@ import { GRID_W, GRID_H } from "@/game/constants";
 import { loadLandMask } from "@/game/landMask";
 import worldMap from "@/assets/map-world.jpg";
 import { Button } from "@/components/ui/button";
-import { LogOut, Shield, Factory, Hammer, Sword } from "lucide-react";
+import { LogOut, Shield, Factory, Sword } from "lucide-react";
 import { toast } from "sonner";
-
-type Lobby = {
-  id: string;
-  code: string;
-  host_id: string;
-  map_id: string;
-  difficulty: string;
-};
-type LobbyPlayer = {
-  id: string;
-  player_id: string;
-  name: string;
-  color: string;
-  is_bot: boolean;
-  dot_x: number;
-  dot_y: number;
-  units: number;
-  pixels: number;
-  alive: boolean;
-};
-
-type BuildingType = "fort" | "factory";
-type Building = { type: BuildingType; ownerIdx: number; gridIdx: number };
+import type { Lobby, LobbyPlayer, Building, BuildingType, Claim, AttackResult } from "@/game/types";
+import {
+  DIFFICULTY_REGEN, COST_EMPTY, FACTORY_INCOME, STARTER_RADIUS, BUILD_COST, hexRgb,
+} from "@/game/balance";
+import { floodAttack, plantStarterCluster } from "@/game/flood";
+import {
+  computeMapRect, drawTerritory, drawCellBorders, drawBuildings, drawNameplates,
+  type MapRect,
+} from "@/game/render";
 
 interface GameScreenProps {
   lobby: Lobby;
@@ -36,32 +22,10 @@ interface GameScreenProps {
   onLeave: () => void;
 }
 
-function hexRgb(hex: string): [number, number, number] {
-  const c = hex.replace("#", "");
-  return [parseInt(c.slice(0, 2), 16), parseInt(c.slice(2, 4), 16), parseInt(c.slice(4, 6), 16)];
-}
-
-const DIFFICULTY_REGEN: Record<string, number> = {
-  relaxed: 0.6,
-  balanced: 1.0,
-  intense: 1.5,
-};
-
-// Costs per cube during a march
-const COST_EMPTY = 1;       // claim an empty cube
-const COST_ENEMY_BASE = 4;  // claim an enemy cube (multiplied by fort defense)
-const FORT_DEFENSE = 3;     // enemy fort cubes cost N× more
-const FACTORY_INCOME = 6;   // units per sync per factory
-const STARTER_RADIUS = 2;   // starter cluster size
-const BUILD_COST: Record<BuildingType, number> = { fort: 120, factory: 180 };
-
 type CtxMenu = {
-  screenX: number;
-  screenY: number;
-  gx: number;
-  gy: number;
-  isOwnTerritory: boolean;
-  isLand: boolean;
+  screenX: number; screenY: number;
+  gx: number; gy: number;
+  isOwnTerritory: boolean; isLand: boolean;
 } | null;
 
 export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
@@ -97,7 +61,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
   const camRef = useRef({ x: 0, y: 0, zoom: 1 });
   const dragRef = useRef({ active: false, startX: 0, startY: 0, camX: 0, camY: 0 });
   const dragMovedRef = useRef(false);
-  const mapRectRef = useRef({ x: 0, y: 0, w: 0, h: 0 });
+  const mapRectRef = useRef<MapRect>({ x: 0, y: 0, w: 0, h: 0 });
 
   const screenToGrid = useCallback((sx: number, sy: number) => {
     const canvas = canvasRef.current;
@@ -115,7 +79,20 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     return { gx, gy };
   }, []);
 
-  // Load players + subscribe realtime
+  // Defender strength helper used by flood
+  const defenderStrength = useCallback((defIdx: number) => {
+    const entry = [...playerIndexRef.current.entries()].find(([, v]) => v === defIdx);
+    const p = entry ? playersRef.current.get(entry[0]) : null;
+    return p ? Math.max(1, Math.sqrt(p.units) / 5) : 1;
+  }, []);
+
+  // Broadcast helper
+  const broadcastClaims = useCallback((claims: Claim[]) => {
+    if (claims.length > 0)
+      channelRef.current?.send({ type: "broadcast", event: "claim", payload: claims });
+  }, []);
+
+  // Subscribe + initial load
   useEffect(() => {
     let active = true;
     async function load() {
@@ -147,7 +124,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
           });
         })
       .on("broadcast", { event: "claim" }, ({ payload }) => {
-        const claims = payload as { i: number; o: number }[];
+        const claims = payload as Claim[];
         const grid = ownerGridRef.current;
         for (const c of claims) grid[c.i] = c.o;
       })
@@ -163,6 +140,52 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
   }, [lobby.id]);
 
   useEffect(() => { loadLandMask().then((m) => { landMaskRef.current = m; }); }, []);
+
+  // Run an attack and persist unit cost
+  const runAttack = useCallback((targetIdx: number, sendUnits: number, ownerIdx: number, ownerPid: string, currentUnits: number): AttackResult => {
+    const mask = landMaskRef.current;
+    if (!mask) return { spent: 0, captured: 0, repelled: false };
+
+    // Attacker pixel count for size discount
+    const grid = ownerGridRef.current;
+    let attackerSize = 0;
+    for (let i = 0; i < grid.length; i++) if (grid[i] === ownerIdx) attackerSize++;
+
+    const res = floodAttack({
+      ownerGrid: grid,
+      landMask: mask,
+      buildings: buildingsRef.current,
+      ownerIdx, targetIdx, sendUnits,
+      defenderStrength, attackerSize,
+    });
+
+    broadcastClaims(res.claims);
+
+    const newUnits = Math.max(0, currentUnits - res.spent);
+    const playerObj = playersRef.current.get(ownerPid);
+    if (playerObj) playerObj.units = newUnits;
+    if (res.spent > 0) {
+      supabase.from("lobby_players").update({ units: newUnits })
+        .eq("lobby_id", lobby.id).eq("player_id", ownerPid);
+    }
+
+    return {
+      spent: res.spent, captured: res.claims.length,
+      repelled: res.claims.length === 0,
+      reachedTarget: res.reachedTarget, unreachable: res.unreachable,
+    };
+  }, [broadcastClaims, defenderStrength, lobby.id]);
+
+  // Plant starter
+  const plantStarter = useCallback((centerIdx: number, ownerIdx: number) => {
+    const mask = landMaskRef.current;
+    if (!mask) return;
+    const claims = plantStarterCluster({
+      ownerGrid: ownerGridRef.current, landMask: mask,
+      centerIdx, ownerIdx, radius: STARTER_RADIUS,
+    });
+    broadcastClaims(claims);
+  }, [broadcastClaims]);
 
   // Render + sim loop
   useEffect(() => {
@@ -186,17 +209,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
       canvas!.height = r.height * devicePixelRatio;
       canvas!.style.width = `${r.width}px`;
       canvas!.style.height = `${r.height}px`;
-      mapRectRef.current = computeMapRect();
-    }
-    function computeMapRect() {
-      const w = canvas!.width;
-      const h = canvas!.height;
-      const mapRatio = 1920 / 960;
-      const canvasRatio = w / h;
-      let mw: number, mh: number, mx: number, my: number;
-      if (canvasRatio > mapRatio) { mh = h; mw = h * mapRatio; mx = (w - mw) / 2; my = 0; }
-      else { mw = w; mh = w / mapRatio; mx = 0; my = (h - mh) / 2; }
-      return { x: mx, y: my, w: mw, h: mh };
+      mapRectRef.current = computeMapRect(canvas!.width, canvas!.height);
     }
     resize();
     const ro = new ResizeObserver(resize);
@@ -217,7 +230,6 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         const idx = playerIndexRef.current.get(p.player_id);
         if (idx === undefined) return;
         const px = counts[idx] ?? 0;
-        // Passive regen: scales with territory (sqrt to avoid runaway)
         const passive = Math.round(Math.sqrt(px) * 2 * regenMult);
         const bonus = Math.round(factoryBonus[idx] || 0);
         const newUnits = Math.min(99999, p.units + passive + bonus);
@@ -229,155 +241,28 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
       await Promise.all(updates);
     }
 
-    function drawBuildingIcon(x: number, y: number, type: BuildingType, color: string) {
-      ctx.save();
-      ctx.fillStyle = color;
-      ctx.strokeStyle = "rgba(0,0,0,0.85)";
-      ctx.lineWidth = 1.5;
-      if (type === "fort") {
-        ctx.beginPath();
-        ctx.moveTo(x, y - 7); ctx.lineTo(x + 6, y - 3); ctx.lineTo(x + 6, y + 3);
-        ctx.lineTo(x, y + 7); ctx.lineTo(x - 6, y + 3); ctx.lineTo(x - 6, y - 3);
-        ctx.closePath(); ctx.fill(); ctx.stroke();
-      } else {
-        ctx.fillRect(x - 6, y - 6, 12, 12);
-        ctx.strokeRect(x - 6, y - 6, 12, 12);
-        ctx.fillRect(x - 3, y - 11, 3, 6);
-        ctx.strokeRect(x - 3, y - 11, 3, 6);
-      }
-      ctx.restore();
-    }
-
     function render() {
-      const w = canvas!.width;
-      const h = canvas!.height;
+      const w = canvas!.width, h = canvas!.height;
       ctx.clearRect(0, 0, w, h);
       ctx.fillStyle = "#0a1628";
       ctx.fillRect(0, 0, w, h);
 
-      const mr = computeMapRect();
+      const mr = computeMapRect(w, h);
       mapRectRef.current = mr;
-      const { x: mx, y: my, w: mw, h: mh } = mr;
 
       const cam = camRef.current;
       ctx.save();
       ctx.translate(cam.x, cam.y);
       ctx.scale(cam.zoom, cam.zoom);
 
-      if (bgImg.complete) ctx.drawImage(bgImg, mx, my, mw, mh);
-      else { ctx.fillStyle = "#1a3050"; ctx.fillRect(mx, my, mw, mh); }
+      if (bgImg.complete) ctx.drawImage(bgImg, mr.x, mr.y, mr.w, mr.h);
+      else { ctx.fillStyle = "#1a3050"; ctx.fillRect(mr.x, mr.y, mr.w, mr.h); }
 
-      // Territory cubes — sharp pixelated render
       const grid = ownerGridRef.current;
-      const colors = colorsRef.current;
-      const data = imgData.data;
-      for (let i = 0; i < grid.length; i++) {
-        const o = grid[i];
-        if (o < 0 || !colors[o]) { data[i * 4 + 3] = 0; }
-        else {
-          const c = colors[o];
-          data[i * 4] = c[0]; data[i * 4 + 1] = c[1]; data[i * 4 + 2] = c[2];
-          data[i * 4 + 3] = 200;
-        }
-      }
-      offCtx.putImageData(imgData, 0, 0);
-      // Crisp cube look — disable smoothing
-      ctx.imageSmoothingEnabled = false;
-      ctx.drawImage(off, mx, my, mw, mh);
-      ctx.imageSmoothingEnabled = true;
-
-      // Cell border grid (only when zoomed in enough)
-      if (cam.zoom > 1.5) {
-        const cellW = mw / GRID_W;
-        const cellH = mh / GRID_H;
-        ctx.strokeStyle = "rgba(0,0,0,0.18)";
-        ctx.lineWidth = 0.5 / cam.zoom;
-        for (let i = 0; i < grid.length; i++) {
-          if (grid[i] < 0) continue;
-          const x = i % GRID_W, y = Math.floor(i / GRID_W);
-          ctx.strokeRect(mx + x * cellW, my + y * cellH, cellW, cellH);
-        }
-      }
-
-      // Buildings
-      const blds = buildingsRef.current;
-      blds.forEach((b) => {
-        const bx = (b.gridIdx % GRID_W) / GRID_W;
-        const by = Math.floor(b.gridIdx / GRID_W) / GRID_H;
-        const px = mx + bx * mw + (mw / GRID_W) / 2;
-        const py = my + by * mh + (mh / GRID_H) / 2;
-        const ownerEntry = [...playerIndexRef.current.entries()].find(([, v]) => v === b.ownerIdx);
-        const owner = ownerEntry ? playersRef.current.get(ownerEntry[0]) : null;
-        drawBuildingIcon(px, py, b.type, owner?.color ?? "#fff");
-      });
-
-      // ── Nameplates ────────────────────────────────────────────────────────
-      // For each player with territory, compute the centroid of their cells and
-      // draw a name tag. Only shown when zoomed in enough that they don't crowd.
-      if (cam.zoom > 0.6) {
-        const nameplateScale = Math.min(1, cam.zoom); // don't blow up at high zoom
-        const fontSize = Math.round(11 * nameplateScale);
-        ctx.save();
-        ctx.font = `bold ${fontSize}px sans-serif`;
-        ctx.textAlign = "center";
-        ctx.textBaseline = "middle";
-
-        // Accumulate centroid sums per player index
-        const sumX = new Float64Array(colorsRef.current.length);
-        const sumY = new Float64Array(colorsRef.current.length);
-        const countP = new Int32Array(colorsRef.current.length);
-        for (let i = 0; i < grid.length; i++) {
-          const o = grid[i];
-          if (o < 0 || o >= colorsRef.current.length) continue;
-          sumX[o] += i % GRID_W;
-          sumY[o] += Math.floor(i / GRID_W);
-          countP[o]++;
-        }
-
-        playerIndexRef.current.forEach((idx, pid) => {
-          if (countP[idx] < 6) return; // too small to label
-          const p = playersRef.current.get(pid);
-          if (!p || !p.alive) return;
-
-          const cx = sumX[idx] / countP[idx];
-          const cy = sumY[idx] / countP[idx];
-          // Map grid coords → canvas coords (pre-camera-transform, since we're inside ctx.save/translate/scale)
-          const sx = mx + (cx / GRID_W) * mw;
-          const sy = my + (cy / GRID_H) * mh;
-
-          const label = p.name;
-          const textW = ctx.measureText(label).width;
-          const pad = 4;
-          const bh = fontSize + pad * 2;
-          const bw = textW + pad * 2;
-
-          // Pill background
-          ctx.fillStyle = "rgba(0,0,0,0.62)";
-          ctx.beginPath();
-          ctx.roundRect(sx - bw / 2, sy - bh / 2, bw, bh, bh / 2);
-          ctx.fill();
-
-          // Coloured left accent bar
-          ctx.fillStyle = p.color;
-          ctx.beginPath();
-          ctx.roundRect(sx - bw / 2, sy - bh / 2, 3, bh, [bh / 2, 0, 0, bh / 2]);
-          ctx.fill();
-
-          // Name text
-          ctx.fillStyle = "#ffffff";
-          ctx.fillText(label, sx + 2, sy);
-
-          // Unit count below name (only when zoomed in)
-          if (cam.zoom > 1.2) {
-            const unitLabel = `${p.units}u`;
-            ctx.font = `${Math.round(9 * nameplateScale)}px sans-serif`;
-            ctx.fillStyle = "rgba(255,255,255,0.65)";
-            ctx.fillText(unitLabel, sx + 2, sy + fontSize);
-            ctx.font = `bold ${fontSize}px sans-serif`; // restore for next player
-          }
-        });
-        ctx.restore();
-      }
+      drawTerritory(ctx, off, offCtx, imgData, grid, colorsRef.current, mr);
+      drawCellBorders(ctx, grid, mr, cam.zoom);
+      drawBuildings(ctx, buildingsRef.current, mr, playerIndexRef.current, playersRef.current);
+      drawNameplates(ctx, grid, mr, cam.zoom, playerIndexRef.current, playersRef.current, colorsRef.current.length);
 
       ctx.restore();
     }
@@ -387,7 +272,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
 
       if (now - lastSyncRef.current > 1500) { lastSyncRef.current = now; syncStats(); }
 
-      // Bots act periodically — simple "click random enemy/empty cube on frontier"
+      // Bots
       if (lobby.host_id === playerId && now - lastBotMoveRef.current > 2200) {
         lastBotMoveRef.current = now;
         const mask = landMaskRef.current;
@@ -398,11 +283,9 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
             const idx = playerIndexRef.current.get(bot.player_id);
             if (idx === undefined) return;
 
-            // Find bot territory
             const owned: number[] = [];
             for (let i = 0; i < grid.length; i++) if (grid[i] === idx) owned.push(i);
 
-            // If bot has nothing yet, plant starter
             if (owned.length === 0) {
               const candidates: number[] = [];
               for (let i = 0; i < mask.length; i++)
@@ -414,10 +297,9 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
             }
             if (bot.units < 30) return;
 
-            // Find a frontier target: adjacent unowned/enemy cube
             const frontierTargets: number[] = [];
             for (const i of owned) {
-              const x = i % GRID_W, y = Math.floor(i / GRID_W);
+              const x = i % GRID_W, y = (i / GRID_W) | 0;
               for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]] as const) {
                 const nx = x+dx, ny = y+dy;
                 if (nx<0||ny<0||nx>=GRID_W||ny>=GRID_H) continue;
@@ -429,7 +311,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
             if (frontierTargets.length === 0) return;
             const target = frontierTargets[Math.floor(Math.random() * frontierTargets.length)];
             const sendUnits = Math.floor(bot.units * (0.4 + Math.random() * 0.3));
-            executeAttack(target, sendUnits, idx, bot.player_id, bot.units);
+            runAttack(target, sendUnits, idx, bot.player_id, bot.units);
           });
         }
       }
@@ -481,175 +363,8 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
       window.removeEventListener("mousemove", onMouseMove);
       window.removeEventListener("mouseup", onMouseUp);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [lobby.id, lobby.host_id, lobby.difficulty, playerId]);
+  }, [lobby.id, lobby.host_id, lobby.difficulty, playerId, plantStarter, runAttack]);
 
-  // Plant starter cluster (used for both player + bots)
-  function plantStarter(centerIdx: number, ownerIdx: number) {
-    const mask = landMaskRef.current;
-    if (!mask) return;
-    const grid = ownerGridRef.current;
-    const cx = centerIdx % GRID_W;
-    const cy = Math.floor(centerIdx / GRID_W);
-    const claims: { i: number; o: number }[] = [];
-    for (let dy = -STARTER_RADIUS; dy <= STARTER_RADIUS; dy++) {
-      for (let dx = -STARTER_RADIUS; dx <= STARTER_RADIUS; dx++) {
-        const x = cx + dx, y = cy + dy;
-        if (x < 0 || y < 0 || x >= GRID_W || y >= GRID_H) continue;
-        const i = y * GRID_W + x;
-        if (mask[i] && grid[i] === -1) {
-          grid[i] = ownerIdx;
-          claims.push({ i, o: ownerIdx });
-        }
-      }
-    }
-    if (claims.length > 0)
-      channelRef.current?.send({ type: "broadcast", event: "claim", payload: claims });
-  }
-
-  // ─── PRESSURE FLOOD ATTACK ───────────────────────────────────────────────
-  // Models territory like a liquid under pressure. Units pour outward from your
-  // ENTIRE border at once, biased toward the target cell (nearest cells processed
-  // first). The flood spreads in every direction simultaneously — clicking a
-  // distant point directs the flow, but pressure also spills into easy adjacent
-  // empty cells along the way. When pressure runs out the front stalls visibly.
-  function executeAttack(
-    targetIdx: number,
-    sendUnits: number,
-    ownerIdx: number,
-    ownerPid: string,
-    currentUnits: number
-  ) {
-    const mask = landMaskRef.current;
-    if (!mask) return { spent: 0, captured: 0, repelled: false };
-    const grid = ownerGridRef.current;
-    const blds = buildingsRef.current;
-
-    // ── 1. Collect border frontier (owned cells with at least one non-owned neighbour) ──
-    const visited = new Uint8Array(grid.length);
-    const seedQueue: number[] = [];
-    let hasOwned = false;
-
-    for (let i = 0; i < grid.length; i++) {
-      if (grid[i] !== ownerIdx) continue;
-      hasOwned = true;
-      visited[i] = 1; // mark owned cells so they are never re-processed
-      const x = i % GRID_W, y = Math.floor(i / GRID_W);
-      for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]] as const) {
-        const nx = x+dx, ny = y+dy;
-        if (nx<0||ny<0||nx>=GRID_W||ny>=GRID_H) continue;
-        const ni = ny*GRID_W+nx;
-        if (!visited[ni] && mask[ni] && grid[ni] !== ownerIdx) {
-          visited[ni] = 1;
-          seedQueue.push(ni);
-        }
-      }
-    }
-    if (!hasOwned) return { spent: 0, captured: 0, repelled: false };
-    if (seedQueue.length === 0) return { spent: 0, captured: 0, repelled: false, unreachable: true };
-
-    // ── 2. Check reachability: can we BFS from border to target at all? ──
-    // (quick check before the expensive priority flood)
-    {
-      const reach = new Uint8Array(grid.length);
-      const q: number[] = [...seedQueue];
-      q.forEach(i => reach[i] = 1);
-      let reachable = false;
-      let h = 0;
-      while (h < q.length) {
-        const cur = q[h++];
-        if (cur === targetIdx) { reachable = true; break; }
-        const x = cur % GRID_W, y = Math.floor(cur / GRID_W);
-        for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]] as const) {
-          const nx = x+dx, ny = y+dy;
-          if (nx<0||ny<0||nx>=GRID_W||ny>=GRID_H) continue;
-          const ni = ny*GRID_W+nx;
-          if (!reach[ni] && mask[ni]) { reach[ni] = 1; q.push(ni); }
-        }
-      }
-      if (!reachable) return { spent: 0, captured: 0, repelled: false, unreachable: true };
-    }
-
-    // ── 3. Pressure flood with distance-to-target priority ──
-    // Bucket queue sorted by Manhattan distance to target — nearest processed first.
-    // This naturally directs the flow toward where you clicked while still
-    // letting the flood spill into any cheap adjacent cells along the way.
-    const tx = targetIdx % GRID_W, ty = Math.floor(targetIdx / GRID_W);
-    const maxDist = GRID_W + GRID_H;
-    const buckets: number[][] = Array.from({ length: maxDist + 1 }, () => []);
-    for (const ni of seedQueue) {
-      const d = Math.abs(ni % GRID_W - tx) + Math.abs(Math.floor(ni / GRID_W) - ty);
-      buckets[Math.min(d, maxDist)].push(ni);
-    }
-
-    // Defender strength cache
-    const defCache = new Map<number, number>();
-    function defStr(defIdx: number) {
-      if (defCache.has(defIdx)) return defCache.get(defIdx)!;
-      const entry = [...playerIndexRef.current.entries()].find(([, v]) => v === defIdx);
-      const p = entry ? playersRef.current.get(entry[0]) : null;
-      const s = p ? Math.max(1, Math.sqrt(p.units) / 5) : 1;
-      defCache.set(defIdx, s);
-      return s;
-    }
-
-    let pressure = sendUnits;
-    const claims: { i: number; o: number }[] = [];
-    let captured = 0;
-    let reachedTarget = false;
-
-    outer:
-    for (let d = 0; d <= maxDist && pressure > 0; d++) {
-      const bucket = buckets[d];
-      if (!bucket || bucket.length === 0) continue;
-      for (let bi = 0; bi < bucket.length && pressure > 0; bi++) {
-        const ni = bucket[bi];
-        const cur = grid[ni];
-        if (cur === ownerIdx) continue; // already ours (shouldn't happen but guard)
-
-        // Cost to absorb this cell
-        const hasFort = cur !== -1 && blds.some((b) => b.gridIdx === ni && b.type === "fort");
-        const cost = cur === -1
-          ? COST_EMPTY
-          : Math.ceil(COST_ENEMY_BASE * (hasFort ? FORT_DEFENSE : 1) * defStr(cur));
-
-        if (pressure < cost) continue; // not enough pressure — fluid skips, finds easier path
-
-        pressure -= cost;
-        grid[ni] = ownerIdx;
-        claims.push({ i: ni, o: ownerIdx });
-        captured++;
-        if (ni === targetIdx) reachedTarget = true;
-
-        // Expand newly claimed cell's neighbours into buckets
-        const x = ni % GRID_W, y = Math.floor(ni / GRID_W);
-        for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]] as const) {
-          const nx = x+dx, ny = y+dy;
-          if (nx<0||ny<0||nx>=GRID_W||ny>=GRID_H) continue;
-          const ni2 = ny*GRID_W+nx;
-          if (visited[ni2] || !mask[ni2] || grid[ni2] === ownerIdx) continue;
-          visited[ni2] = 1;
-          const d2 = Math.abs(nx - tx) + Math.abs(ny - ty);
-          buckets[Math.min(d2, maxDist)].push(ni2);
-        }
-      }
-    }
-
-    if (claims.length > 0)
-      channelRef.current?.send({ type: "broadcast", event: "claim", payload: claims });
-
-    const actuallySpent = sendUnits - pressure;
-    const newUnits = Math.max(0, currentUnits - actuallySpent);
-    const playerObj = playersRef.current.get(ownerPid);
-    if (playerObj) playerObj.units = newUnits;
-    supabase.from("lobby_players")
-      .update({ units: newUnits })
-      .eq("lobby_id", lobby.id).eq("player_id", ownerPid);
-
-    return { spent: actuallySpent, captured, repelled: captured === 0, reachedTarget, unreachable: false };
-  }
-
-  // CLICK — either plant starter (if no territory) or attack target cube
   function handleClick(e: React.MouseEvent) {
     if (dragMovedRef.current) { dragMovedRef.current = false; return; }
     if (ctxMenu) { setCtxMenu(null); return; }
@@ -665,30 +380,27 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     const grid = ownerGridRef.current;
     const mask = landMaskRef.current;
     if (!mask) return;
-    if (!mask[i]) { showNotif("Click a land cube"); return; }
+    if (!mask[i]) { showNotif("Click a land cell"); return; }
 
-    // Count my cubes
-    let mineCount = 0;
-    for (let k = 0; k < grid.length; k++) if (grid[k] === myIdx) { mineCount++; if (mineCount > 0) break; }
+    let hasAny = false;
+    for (let k = 0; k < grid.length; k++) if (grid[k] === myIdx) { hasAny = true; break; }
 
-    // No starter yet → plant here
-    if (mineCount === 0) {
-      if (grid[i] !== -1) { showNotif("Pick an unclaimed land cube to start"); return; }
+    if (!hasAny) {
+      if (grid[i] !== -1) { showNotif("Pick an unclaimed land cell to start"); return; }
       plantStarter(i, myIdx);
       setHasSpawned(true);
-      showNotif("Empire founded! Click any cube to expand.", "success");
+      showNotif("Empire founded! Click anywhere to flood your front toward it.", "success");
       return;
     }
 
-    // Attack target with sendPct of my units
-    if (grid[i] === myIdx) { showNotif("You already own that cube"); return; }
+    if (grid[i] === myIdx) { showNotif("You already own that cell"); return; }
     const sending = Math.max(1, Math.floor(me.units * sendPctRef.current / 100));
     if (sending < COST_EMPTY) { showNotif("Not enough units", "error"); return; }
 
-    const result = executeAttack(i, sending, myIdx, playerId, me.units);
+    const result = runAttack(i, sending, myIdx, playerId, me.units);
     if (result.unreachable) { showNotif("No land path to that point", "error"); return; }
-    if (result.captured === 0) { showNotif("Pressure repelled — enemy too strong", "error"); return; }
-    if (!result.reachedTarget) showNotif(`Flooded ${result.captured} cells — pressure stalled short of target`, "info");
+    if (result.captured === 0) { showNotif("Attack repelled — defenders too strong", "error"); return; }
+    if (!result.reachedTarget) showNotif(`Front advanced ${result.captured} cells — stalled before target`, "info");
   }
 
   function handleContextMenu(e: React.MouseEvent) {
@@ -714,7 +426,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     const cost = BUILD_COST[type];
     if (me.units < cost) { showNotif(`Need ${cost} units to build ${type}`, "error"); return; }
     const gridIdx = gy * GRID_W + gx;
-    if (ownerGridRef.current[gridIdx] !== myIdx) { showNotif("Build on your own cubes only", "error"); return; }
+    if (ownerGridRef.current[gridIdx] !== myIdx) { showNotif("Build on your own cells only", "error"); return; }
     if (buildingsRef.current.some((b) => b.gridIdx === gridIdx)) { showNotif("Already a building here", "error"); return; }
 
     const building: Building = { type, ownerIdx: myIdx, gridIdx };
@@ -730,7 +442,6 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
 
   const sortedPlayers = [...players].sort((a, b) => b.pixels - a.pixels);
   const me = playersRef.current.get(playerId);
-  const myIdx = playerIndexRef.current.get(playerId);
   const myCubeCount = me ? me.pixels : 0;
   const sendingUnits = me ? Math.max(1, Math.floor(me.units * sendPct / 100)) : 0;
 
@@ -744,15 +455,13 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         onContextMenu={handleContextMenu}
       />
 
-      {/* Starter prompt */}
       {me && myCubeCount === 0 && !hasSpawned && (
         <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 rounded-xl border border-primary/60 bg-card/95 px-6 py-4 text-center shadow-2xl backdrop-blur-md">
-          <div className="text-lg font-bold text-foreground mb-1">Pick your starting cube</div>
-          <div className="text-sm text-muted-foreground">Click any land cube on the map to found your empire</div>
+          <div className="text-lg font-bold text-foreground mb-1">Pick your starting cell</div>
+          <div className="text-sm text-muted-foreground">Click any land cell on the map to found your empire</div>
         </div>
       )}
 
-      {/* Leaderboard */}
       <div className="absolute right-3 top-3 w-56 rounded-xl border border-border/60 bg-card/85 p-2 shadow-lg backdrop-blur-md">
         <div className="mb-1 px-2 text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Leaderboard</div>
         <div className="space-y-0.5">
@@ -771,7 +480,6 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         <LogOut className="h-3.5 w-3.5" /> Leave
       </Button>
 
-      {/* Bottom HUD */}
       <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-4 rounded-xl border border-border/60 bg-card/90 px-5 py-2.5 backdrop-blur-md shadow-lg">
         <div className="flex flex-col items-center gap-1">
           <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Send</span>
@@ -787,19 +495,16 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         <div className="flex flex-col items-center gap-1 px-1">
           <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Click to attack</span>
           <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-            <Sword className="h-3 w-3" /> click any cube
+            <Sword className="h-3 w-3" /> click any cell · right-click to build
           </div>
         </div>
         <div className="h-10 w-px bg-border" />
         <div className="flex gap-1">
-          <button title="Zoom in"
-            onClick={() => { const c = camRef.current; c.zoom = Math.min(8, c.zoom * 1.25); }}
+          <button title="Zoom in" onClick={() => { const c = camRef.current; c.zoom = Math.min(8, c.zoom * 1.25); }}
             className="flex h-7 w-7 items-center justify-center rounded border border-border bg-background/60 text-sm hover:bg-secondary">+</button>
-          <button title="Zoom out"
-            onClick={() => { const c = camRef.current; c.zoom = Math.max(0.4, c.zoom * 0.8); }}
+          <button title="Zoom out" onClick={() => { const c = camRef.current; c.zoom = Math.max(0.4, c.zoom * 0.8); }}
             className="flex h-7 w-7 items-center justify-center rounded border border-border bg-background/60 text-sm hover:bg-secondary">−</button>
-          <button title="Reset view"
-            onClick={() => { camRef.current = { x: 0, y: 0, zoom: 1 }; }}
+          <button title="Reset view" onClick={() => { camRef.current = { x: 0, y: 0, zoom: 1 }; }}
             className="flex h-7 w-7 items-center justify-center rounded border border-border bg-background/60 text-xs hover:bg-secondary">⌂</button>
         </div>
         {me && (
@@ -808,19 +513,17 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
             <div className="flex items-center gap-2 text-xs">
               <span className="h-2.5 w-2.5 rounded-sm" style={{ backgroundColor: me.color }} />
               <span className="font-medium">{me.name}</span>
-              <span className="font-mono text-muted-foreground">{me.units}u · {me.pixels} cubes</span>
+              <span className="font-mono text-muted-foreground">{me.units}u · {me.pixels} cells</span>
             </div>
           </>
         )}
       </div>
 
       {ctxMenu && (
-        <div
-          className="fixed z-50 min-w-[200px] overflow-hidden rounded-lg border border-border bg-card shadow-2xl"
-          style={{ top: ctxMenu.screenY, left: ctxMenu.screenX }}
-        >
+        <div className="fixed z-50 min-w-[200px] overflow-hidden rounded-lg border border-border bg-card shadow-2xl"
+          style={{ top: ctxMenu.screenY, left: ctxMenu.screenX }}>
           <div className="px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider text-muted-foreground border-b border-border">
-            Cube ({ctxMenu.gx}, {ctxMenu.gy})
+            Cell ({ctxMenu.gx}, {ctxMenu.gy})
           </div>
 
           {ctxMenu.isLand && !ctxMenu.isOwnTerritory && (
@@ -831,47 +534,36 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
               if (!meNow || myIdxNow === undefined) return;
               const sending = Math.max(1, Math.floor(meNow.units * sendPctRef.current / 100));
               const i = ctxMenu.gy * GRID_W + ctxMenu.gx;
-              const r = executeAttack(i, sending, myIdxNow, playerId, meNow.units);
-              if (r.unreachable) showNotif("No land path to that cube", "error");
+              const r = runAttack(i, sending, myIdxNow, playerId, meNow.units);
+              if (r.unreachable) showNotif("No land path to that cell", "error");
               else if (r.captured === 0) showNotif("Attack repelled", "error");
-              else showNotif(`Captured ${r.captured} cubes`, "success");
             }}
-              className="flex w-full items-center justify-between px-3 py-2 text-sm hover:bg-secondary text-left transition-colors">
-              <span className="flex items-center gap-2"><Sword className="h-3.5 w-3.5" /> Attack</span>
-              <span className="text-xs text-muted-foreground">{sendingUnits}u</span>
+              className="flex w-full items-center gap-2 px-3 py-2 text-sm hover:bg-secondary">
+              <Sword className="h-4 w-4 text-red-500" /> Attack ({sendingUnits}u)
             </button>
           )}
 
           {ctxMenu.isOwnTerritory && (
             <>
-              <div className="px-3 py-1 text-[10px] font-bold uppercase tracking-wider text-muted-foreground border-t border-border flex items-center gap-1.5">
-                <Hammer className="h-3 w-3" /> Build
-              </div>
-              <button
-                disabled={!me || me.units < BUILD_COST.fort}
-                onClick={() => doBuild(ctxMenu.gx, ctxMenu.gy, "fort")}
-                className="flex w-full items-center justify-between px-3 py-2 text-sm hover:bg-secondary text-left transition-colors disabled:opacity-40 disabled:cursor-not-allowed">
-                <span className="flex items-center gap-2"><Shield className="h-3.5 w-3.5 text-amber-400" /> Fort <span className="text-[10px] text-muted-foreground">(3× defense)</span></span>
-                <span className="text-xs text-muted-foreground">{BUILD_COST.fort}u</span>
+              <button onClick={() => doBuild(ctxMenu.gx, ctxMenu.gy, "fort")}
+                className="flex w-full items-center gap-2 px-3 py-2 text-sm hover:bg-secondary">
+                <Shield className="h-4 w-4 text-blue-400" />
+                Build Fort <span className="ml-auto text-xs text-muted-foreground">{BUILD_COST.fort}u</span>
               </button>
-              <button
-                disabled={!me || me.units < BUILD_COST.factory}
-                onClick={() => doBuild(ctxMenu.gx, ctxMenu.gy, "factory")}
-                className="flex w-full items-center justify-between px-3 py-2 text-sm hover:bg-secondary text-left transition-colors disabled:opacity-40 disabled:cursor-not-allowed">
-                <span className="flex items-center gap-2"><Factory className="h-3.5 w-3.5 text-blue-400" /> Factory <span className="text-[10px] text-muted-foreground">(+{FACTORY_INCOME} income)</span></span>
-                <span className="text-xs text-muted-foreground">{BUILD_COST.factory}u</span>
+              <button onClick={() => doBuild(ctxMenu.gx, ctxMenu.gy, "factory")}
+                className="flex w-full items-center gap-2 px-3 py-2 text-sm hover:bg-secondary">
+                <Factory className="h-4 w-4 text-amber-400" />
+                Build Factory <span className="ml-auto text-xs text-muted-foreground">{BUILD_COST.factory}u</span>
               </button>
             </>
           )}
 
-          {!ctxMenu.isLand && (
-            <div className="px-3 py-2 text-xs text-muted-foreground">Ocean — no actions</div>
-          )}
+          <button onClick={() => setCtxMenu(null)}
+            className="w-full border-t border-border px-3 py-1.5 text-xs text-muted-foreground hover:bg-secondary">
+            Cancel
+          </button>
         </div>
       )}
-
-      {/* suppress unused warnings for myIdx */}
-      <span className="hidden">{myIdx}</span>
     </div>
   );
 }
