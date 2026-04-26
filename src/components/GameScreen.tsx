@@ -95,6 +95,27 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     return p ? Math.max(1, Math.sqrt(p.units) / 5) : 1;
   }, []);
 
+  /**
+   * Stage a list of claims to reveal over time so the flood is visible as a
+   * spreading wave (OpenFront style). Claims are expected in BFS order.
+   */
+  const scheduleClaimAnimation = useCallback((claims: Claim[]) => {
+    if (claims.length === 0) return;
+    const grid = ownerGridRef.current;
+    const now = performance.now();
+    const stepMs = 1000 / ATTACK_CELLS_PER_SEC;
+    for (let k = 0; k < claims.length; k++) {
+      const c = claims[k];
+      // Remember pre-claim owner so we can show the OLD value until reveal
+      if (!preClaimOwnerRef.current.has(c.i)) {
+        preClaimOwnerRef.current.set(c.i, grid[c.i]);
+      }
+      // Revert grid to pre-claim value (so the cell isn't visible yet)
+      grid[c.i] = preClaimOwnerRef.current.get(c.i)!;
+      pendingClaimsRef.current.push({ i: c.i, o: c.o, revealAt: now + k * stepMs });
+    }
+  }, []);
+
   // Broadcast helper
   const broadcastClaims = useCallback((claims: Claim[]) => {
     if (claims.length > 0)
