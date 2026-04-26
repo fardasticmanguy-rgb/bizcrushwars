@@ -56,6 +56,7 @@ export type Database = {
       lobby_players: {
         Row: {
           alive: boolean
+          coins: number
           color: string
           dot_x: number
           dot_y: number
@@ -71,6 +72,7 @@ export type Database = {
         }
         Insert: {
           alive?: boolean
+          coins?: number
           color: string
           dot_x?: number
           dot_y?: number
@@ -86,6 +88,7 @@ export type Database = {
         }
         Update: {
           alive?: boolean
+          coins?: number
           color?: string
           dot_x?: number
           dot_y?: number
