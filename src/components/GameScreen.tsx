@@ -12,9 +12,13 @@ import {
 } from "@/game/balance";
 import { floodAttack, plantStarterCluster } from "@/game/flood";
 import {
-  computeMapRect, drawTerritory, drawCellBorders, drawBuildings, drawNameplates,
+  computeMapRect, drawTerritory, drawTerritoryOutlines, drawBuildings, drawTerritoryLabels,
   type MapRect,
 } from "@/game/render";
+
+// How fast the attack flood visibly spreads (cells per second per attack)
+const ATTACK_CELLS_PER_SEC = 220;
+type PendingClaim = { i: number; o: number; revealAt: number };
 
 interface GameScreenProps {
   lobby: Lobby;
