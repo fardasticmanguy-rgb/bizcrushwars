@@ -263,10 +263,22 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
       else { ctx.fillStyle = "#1a3050"; ctx.fillRect(mr.x, mr.y, mr.w, mr.h); }
 
       const grid = ownerGridRef.current;
+
+      // Apply any pending claims whose reveal time has come (animated flood)
+      if (pendingClaimsRef.current.length > 0) {
+        const now2 = performance.now();
+        const stillPending: PendingClaim[] = [];
+        for (const c of pendingClaimsRef.current) {
+          if (c.revealAt <= now2) grid[c.i] = c.o;
+          else stillPending.push(c);
+        }
+        pendingClaimsRef.current = stillPending;
+      }
+
       drawTerritory(ctx, off, offCtx, imgData, grid, colorsRef.current, mr);
-      drawCellBorders(ctx, grid, mr, cam.zoom);
+      drawTerritoryOutlines(ctx, grid, mr, cam.zoom);
       drawBuildings(ctx, buildingsRef.current, mr, playerIndexRef.current, playersRef.current);
-      drawNameplates(ctx, grid, mr, cam.zoom, playerIndexRef.current, playersRef.current, colorsRef.current.length);
+      drawTerritoryLabels(ctx, grid, mr, cam.zoom, playerIndexRef.current, playersRef.current, colorsRef.current.length);
 
       ctx.restore();
     }
