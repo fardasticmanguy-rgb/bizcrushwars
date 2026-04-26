@@ -190,6 +190,8 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
     });
 
     broadcastClaims(res.claims);
+    // Animate locally too: revert in-grid mutations and stage them with delays
+    scheduleClaimAnimation(res.claims);
 
     const newUnits = Math.max(0, currentUnits - res.spent);
     const playerObj = playersRef.current.get(ownerPid);
@@ -204,7 +206,7 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
       repelled: res.claims.length === 0,
       reachedTarget: res.reachedTarget, unreachable: res.unreachable,
     };
-  }, [broadcastClaims, defenderStrength, lobby.id]);
+  }, [broadcastClaims, defenderStrength, lobby.id, scheduleClaimAnimation]);
 
   // Plant starter
   const plantStarter = useCallback((centerIdx: number, ownerIdx: number) => {
