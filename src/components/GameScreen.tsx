@@ -297,8 +297,12 @@ export function GameScreen({ lobby, playerId, onLeave }: GameScreenProps) {
         const now2 = performance.now();
         const stillPending: PendingClaim[] = [];
         for (const c of pendingClaimsRef.current) {
-          if (c.revealAt <= now2) grid[c.i] = c.o;
-          else stillPending.push(c);
+          if (c.revealAt <= now2) {
+            grid[c.i] = c.o;
+            preClaimOwnerRef.current.delete(c.i);
+          } else {
+            stillPending.push(c);
+          }
         }
         pendingClaimsRef.current = stillPending;
       }
